@@ -77,35 +77,74 @@ def test_backtest_charges_the_spread_per_trade():
     assert stats["trades"] >= 1 and stats["sessions"] == 1
 
 
-def test_live_step_signals_only_on_a_fresh_complete_bar_then_closes():
+def fresh(bias="long", **extra):
+    return {"date": DAY.isoformat(), "bias": bias, "seen": None, "open": None, "trades": [], **extra}
+
+
+def pullback_day():
     s = rising()
     s[8] = bar(150, 185, 120, 182)
-    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
-    kind, line = ls.step(state, s, 8, DAY, True, 1.5, 15, 3)
-    assert kind == "SIGNAL" and line.startswith("BUY (long) NAS100 – Kerze bis 16:15 Uhr")
+    return s
+
+
+ANY = {"min_score": 0}  # these tests check the flow, not the score
+
+
+def test_live_step_signals_only_on_a_fresh_complete_bar_then_closes():
+    s = pullback_day()
+    state = fresh()
+    kind, line = ls.step(state, s, 8, DAY, {**ANY, "rr": 1.5})
+    assert kind == "SIGNAL" and line.startswith("BUY (long) NAS100 – VWAP-Pullback, Qualität")
     s[9] = bar(182, 300, 181, 290)
-    kind, line = ls.step(state, s, 9, DAY, True, 1.5, 15, 3)
+    kind, line = ls.step(state, s, 9, DAY, ANY)
     assert kind == "CLOSED" and "ZIEL erreicht" in line and line.endswith("+1,50 R.")
     assert state["open"] is None and len(state["trades"]) == 1
 
 
-def test_live_step_respects_the_trend_filter_and_the_daily_limit():
-    s = rising()
-    s[8] = bar(150, 185, 120, 182)
-    state = {"date": DAY.isoformat(), "bias": "short", "seen": None, "open": None, "trades": []}
-    assert ls.step(state, s, 8, DAY, True, 1.5, 15, 3) is None
-    state = {"date": DAY.isoformat(), "bias": "short", "seen": None, "open": None, "trades": []}
-    assert ls.step(state, s, 8, DAY, False, 1.5, 15, 3)[0] == "SIGNAL"
-    full = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{"r": 1.5}] * 3}
-    assert ls.step(full, s, 8, DAY, True, 1.5, 15, 3)[0] == "END"
-    stopped = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None,
-               "trades": [{"r": -1.0}, {"r": 1.5}, {"r": -1.0}, {"r": -1.0}]}
-    kind, line = ls.step(stopped, s, 8, DAY, True, 1.5, 15, 6)
-    assert kind == "END" and line.startswith("3 Verluste heute: Pause")
-    two = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{"r": -1.0}] * 2}
-    assert ls.step(two, s, 8, DAY, True, 1.5, 15, 6)[0] == "SIGNAL"
-    late = {"date": DAY.isoformat(), "bias": "long", "seen": 66, "open": None, "trades": []}
-    assert ls.step(late, s, 67, DAY, True, 1.5, 15, 3)[0] == "END"
+def test_live_step_respects_the_trend_filter_and_the_limits():
+    s = pullback_day()
+    assert ls.step(fresh("short"), s, 8, DAY, {**ANY, "trend_filter": True}) is None
+    assert ls.step(fresh("short"), s, 8, DAY, ANY)[0] == "SIGNAL"
+    full = fresh(seen=7, trades=[{"r": 1.5, "closed_slot": 7}] * 6)
+    assert ls.step(full, s, 8, DAY, ANY)[0] == "END"
+    late = fresh(seen=66)
+    assert ls.step(late, s, 67, DAY, ANY)[0] == "END"
+
+
+def test_two_losses_in_a_row_pause_for_an_hour_then_signals_resume():
+    s = pullback_day()
+    half = {**ANY, "risk_pct": 0.5}  # at 1 % a trade, two losses already hit the 2 % day limit
+    state = fresh(seen=0, trades=[{"r": -1.0, "closed_slot": 2}, {"r": -1.0, "closed_slot": 5}])
+    kind, line = ls.step(state, s, 6, DAY, half)
+    assert kind == "PAUSE" and line.startswith("2 Verluste in Folge: Pause bis 17:00 Uhr")
+    assert ls.step(state, s, 8, DAY, half) is None  # slot 8 is inside the pause
+    later = rising(18)
+    later[18] = bar(250, 285, 150, 282)  # dips through the rising VWAP, closes back above it
+    assert ls.step(state, later, 18, DAY, half)[0] == "SIGNAL"
+
+
+def test_the_daily_loss_limit_follows_the_risk_per_trade():
+    s = pullback_day()
+    trades = [{"r": -1.0, "closed_slot": 2}, {"r": 0.3, "closed_slot": 4}, {"r": -1.0, "closed_slot": 6},
+              {"r": -0.4, "closed_slot": 7}]
+    kind, line = ls.step(fresh(seen=7, trades=trades), s, 8, DAY, ANY)  # -2.1 R at 1 % = -2.1 %
+    assert kind == "END" and line.startswith("Tagesverlustlimit erreicht")
+    half = {**ANY, "risk_pct": 0.5, "pause_after": 9}  # -2.1 R at 0.5 % = -1.05 %: trading on
+    assert ls.step(fresh(seen=7, trades=trades), s, 8, DAY, half)[0] == "SIGNAL"
+
+
+def test_no_new_signal_around_news():
+    s = pullback_day()
+    state = fresh()
+    assert ls.step(state, s, 8, DAY, {**ANY, "blackouts": ["16:20"]}) is None
+    assert state["skipped"][0]["why"] == "Nachrichten 16:20 Uhr"
+    assert ls.step(fresh(), s, 8, DAY, {**ANY, "blackouts": ["16:40"]})[0] == "SIGNAL"
+
+
+def test_a_low_score_is_no_trade():
+    s = pullback_day()
+    state = fresh("short")  # against the trend, on an impulsive bar, without context: 50 - 8 - 15
+    assert ls.step(state, s, 8, DAY) is None and state["skipped"][0]["why"] == "Score 27"
 
 
 def test_complete_slot_needs_yahoo_data_past_the_bar_end():
@@ -144,19 +183,29 @@ def test_volume_is_compared_with_the_same_time_of_day():
     assert busy["quality"] == "normal"
 
 
-def test_signal_line_shows_the_context():
-    sig = {"slot": 8, "side": "SELL", "entry": 100.0, "stop": 110.0, "target": 85.0, "risk": 10.0,
-           "rr": 1.5, "vwap": 101.0, "context": {"trend_15m": "long", "trend_45m": "short",
-                                                  "rel_volume": 0.74, "open_volume": None, "quality": "mittel"}}
-    line = ls.signal_line(DAY, sig, "short")
-    assert "15 Min aufwärts, 45 Min abwärts" in line and "Signalkerze 0,7x" in line
-    assert "Eröffnung ?" in line and "Qualität MITTEL" in line and "Tagestrend abwärts" in line
+def test_signal_line_follows_the_rulebook_format():
+    sig = {"slot": 8, "side": "SELL", "entry": 100.0, "stop": 110.0, "target": 80.0, "risk": 10.0,
+           "rr": 2.0, "vwap": 101.0, "setup": "vwap", "score": 64,
+           "trends": {"4H": "short", "2H": "short", "1H": "long", "15M": "neutral", "5M": "short"},
+           "context": {"rel_volume": 0.74, "open_volume": None, "quality": "mittel"}}
+    text = ls.signal_line(DAY, sig, "short", {"account": 2000, "risk_pct": 1, "eur_per_point": 1})
+    lines = text.splitlines()
+    assert lines[0] == "SELL (short) NAS100 – VWAP-Pullback, Qualität 64/100"
+    for label in ("MARKTRICHTUNG: Short", "4H: abwärts", "1H: aufwärts", "15M: seitwärts",
+                  "SETUP: Bestätigt (5M-Kerzenschluss 16:15 Uhr)", "EINSTIEG: 98,5 bis 100,0",
+                  "STOP-LOSS: 110,0 (+10,0 Pkt)", "TP1: 90,0", "TP2: 80,0", "TP3: 70,0",
+                  "CHANCE-RISIKO: 1:2,0", "INVALIDIERUNG: 5M-Schluss über dem VWAP 101,0",
+                  "SETUP-QUALITÄT: 64/100", "- Zeitebenen: 3 von 5 mit dem Signal, 1 dagegen (mit dem Tagestrend)",
+                  "- Volumen: Signalkerze 0,7x üblich, Eröffnung ?, Stufe MITTEL",
+                  "POSITIONSGRÖSSE: 2,00 (Risiko 20,0 € = 1,0 % bei 10,0 Pkt Stop)"):
+        assert any(line.startswith(label) for line in lines), label
+    assert "Kontostand und Kontraktwert" in ls.signal_line(DAY, sig, "short")
 
 
 def test_end_of_entries_uses_the_day_s_german_time():
     late = {"date": "2026-10-28", "bias": "long", "seen": 66, "open": None, "trades": []}
     # in the week Europe has left summer time and the US has not, entries end at 20:05
-    assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28), True, 1.5, 15, 3)[1].startswith("20:05 Uhr")
+    assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28))[1].startswith("20:05 Uhr")
 
 
 SIG = {"slot": 8, "side": "BUY", "entry": 100.0, "stop": 90.0, "target": 120.0, "risk": 10.0, "rr": 2.0}
@@ -180,17 +229,16 @@ def test_follow_without_the_move_is_the_plain_outcome():
 
 
 def test_live_sends_one_move_push_then_closes_on_the_trailed_stop():
-    s = rising()
-    s[8] = bar(150, 185, 120, 182)
-    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
-    assert ls.step(state, s, 8, DAY, True, 2.0, 15, 6)[0] == "SIGNAL"
+    s = pullback_day()
+    state = fresh()
+    assert ls.step(state, s, 8, DAY, ANY)[0] == "SIGNAL"
     risk = state["open"]["risk"]
     s[9] = bar(182, 182 + 0.6 * risk, 181, 182 + 0.5 * risk)
-    kind, line = ls.step(state, s, 9, DAY, True, 2.0, 15, 6)
+    kind, line = ls.step(state, s, 9, DAY, ANY)
     assert kind == "MOVE" and line.startswith("STOP NACHZIEHEN – BUY von 16:15 Uhr")
-    assert ls.step(state, s, 9, DAY, True, 2.0, 15, 6) is None
+    assert ls.step(state, s, 9, DAY, ANY) is None
     s[10] = bar(200, 201, 150, 160)
-    kind, line = ls.step(state, s, 10, DAY, True, 2.0, 15, 6)
+    kind, line = ls.step(state, s, 10, DAY, ANY)
     assert kind == "CLOSED" and "nachgezogener Stop erreicht" in line and state["trades"][0]["r"] > 0
 
 
@@ -228,20 +276,19 @@ def test_volume_levels_find_poc_value_area_and_spaced_clusters():
 
 
 def test_live_follows_an_open_signal_on_one_minute_bars():
-    s = rising()
-    s[8] = bar(150, 185, 120, 182)
-    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
-    assert ls.step(state, s, 8, DAY, False, 2.0, 15, 6, minutes=[])[0] == "SIGNAL"
+    s = pullback_day()
+    state = fresh()
+    assert ls.step(state, s, 8, DAY, ANY, minutes=[])[0] == "SIGNAL"
     open_ts = datetime.datetime.combine(DAY, datetime.time(9, 30), tzinfo=ls.NY).timestamp()
-    entry_end = open_ts + 9 * 300
-    minutes = [(entry_end, bar(182, 183, 100, 101))]  # the stop in the first minute after the entry
-    kind, line = ls.step(state, s, 8, DAY, False, 2.0, 15, 6, minutes=minutes)
+    minutes = [(open_ts + 9 * 300, bar(182, 183, 100, 101))]  # the stop in the first minute after the entry
+    kind, line = ls.step(state, s, 8, DAY, ANY, minutes=minutes)
     assert kind == "CLOSED" and "STOP erreicht um 16:16 Uhr" in line
 
 
 def test_signal_line_describes_a_sweep_and_the_clusters():
     sig = {"slot": 20, "side": "SELL", "entry": 101.0, "stop": 133.0, "target": 37.0, "risk": 32.0,
-           "rr": 2.0, "level": 110.0, "volume": 2.0, "setup": "sweep", "clusters": (150.0, None)}
-    line = ls.signal_line(DAY, sig, "long")
-    assert "Fehlausbruch" in line and "die Käufer verlieren den Boden" in line
-    assert "(gegen den Trend)" in line and "Volumen-Cluster: darüber 150,0." in line
+           "rr": 2.0, "level": 110.0, "volume": 2.0, "setup": "sweep", "clusters": (150.0, None), "fomo": True}
+    text = ls.signal_line(DAY, sig, "long")
+    assert "Fehlausbruch (Liquidity Sweep)" in text and "die Käufer verlieren den Boden" in text
+    assert "- Volumen-Cluster darüber 150,0" in text and "FOMO-Regel" in text
+    assert "INVALIDIERUNG: 5M-Schluss wieder über 110,0" in text

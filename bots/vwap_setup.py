@@ -400,3 +400,38 @@ def fetch_minutes(day):
     _, entry = tools()
     ch = entry.get_chart("^NDX", "1m")
     return [(b["t"], {"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]}) for b in ch["bars"]]
+
+
+# ---------------------------------------------------------------- the personal rulebook (bots/REGELWERK.md)
+
+TIMEFRAMES = {"4H": 48, "2H": 24, "1H": 12, "15M": 3, "5M": 1}   # in 5-minute bars
+WEIGHTS = {"4H": 10, "2H": 8, "1H": 8, "15M": 6, "5M": 4}       # the higher timeframe counts more
+MIN_SCORE = 40       # below this the replay lost money: NO TRADE
+IMPULSE = 2.0        # a signal bar this many times the last hour's average range is a FOMO bar
+
+
+def mtf_trends(sessions, day, slot):
+    """Trend per timeframe (close against a sloping 20-period EMA) at a 5-minute slot's close.
+    Built from the regular US session's bars, so the 4H and 2H differ from a 24-hour CFD chart."""
+    return {name: trend_of(higher_bars(sessions, n, (day, slot))) for name, n in TIMEFRAMES.items()}
+
+
+def impulsive(session, sig, look=12):
+    """Whether the signal bar's range is IMPULSE times the last hour's average range or more."""
+    prev = [session[j]["h"] - session[j]["l"] for j in range(sig["slot"] - look, sig["slot"]) if j in session]
+    bar = session.get(sig["slot"])
+    return bool(prev and bar) and (bar["h"] - bar["l"]) >= IMPULSE * sum(prev) / len(prev)
+
+
+def setup_score(trends, side, quality, bias, fomo=False):
+    """0-100: 50, plus or minus each timeframe's weight as it agrees with or opposes the signal,
+    +10/+5 for a calm/medium volume grade, +-8 with or against the daily trend, -15 for a FOMO bar."""
+    want = "long" if side == "BUY" else "short"
+    score = 50
+    for name, weight in WEIGHTS.items():
+        t = trends.get(name, "neutral")
+        score += weight if t == want else -weight if t != "neutral" else 0
+    score += {"hoch": 10, "mittel": 5}.get(quality, 0)
+    score += 0 if bias == "neutral" else 8 if bias == want else -8
+    score -= 15 if fomo else 0
+    return max(0, min(100, score))
