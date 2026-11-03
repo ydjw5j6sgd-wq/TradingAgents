@@ -48,13 +48,26 @@ def num(x):
     return f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+TRENDS = {"long": "aufwärts", "short": "abwärts", "neutral": "seitwärts"}
+
+
+def context_text(ctx):
+    vol = lambda x: f"{num(x)}x" if x is not None else "?"
+    note = {"hoch": "ruhiges Volumen, im Rückblick die besten Signale",
+            "mittel": "teils ruhiges Volumen", "normal": "lebhaftes Volumen"}[ctx["quality"]]
+    return (f" 15 Min {TRENDS[ctx['trend_15m']]}, 45 Min {TRENDS[ctx['trend_45m']]}. "
+            f"Volumen Signalkerze {vol(ctx['rel_volume'])} üblich, Eröffnung {vol(ctx['open_volume'])}. "
+            f"Qualität {ctx['quality'].upper()} ({note}).")
+
+
 def signal_line(day, sig, bias):
     word = "BUY (long)" if sig["side"] == "BUY" else "SELL (short)"
     return (f"{word} NAS100 – Kerze bis {de_time(day, sig['slot'], end=True)} Uhr: Einstieg ~{num(sig['entry'])}, "
             f"Stop {num(sig['stop'])} (-{num(sig['risk'])} Pkt), "
             f"Ziel {num(sig['target'])} (+{num(sig['rr'] * sig['risk'])} Pkt), "
-            f"CRV {num(sig['rr'])} : 1. VWAP {num(sig['vwap'])}, Tagestrend {bias}. "
-            "Index-Kurse: beim CFD Stop und Ziel als Abstand übernehmen. Nichts platziert.")
+            f"CRV {num(sig['rr'])} : 1. VWAP {num(sig['vwap'])}, Tagestrend {TRENDS[bias]}."
+            + (context_text(sig["context"]) if sig.get("context") else "")
+            + " Index-Kurse: beim CFD Stop und Ziel als Abstand übernehmen. Nichts platziert.")
 
 
 def closed_line(day, sig, result, r, slot):
@@ -78,9 +91,10 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades):
+def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades, history=None):
     """Advance the day by the bars up to slot `complete`. Returns (event, line) or None.
 
+    history holds earlier sessions for the 15/45-minute and volume context.
     Pure: no clock and no network, so it can be tested on saved sessions.
     """
     if state["open"]:
@@ -95,7 +109,8 @@ def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades):
     if len(state["trades"]) >= max_trades:
         return "END", f"{max_trades} Signale heute erreicht. Für heute keine weiteren."
     if complete > vs.LAST_ENTRY_SLOT:
-        return "END", "21:00 Uhr vorbei: keine neuen Einstiege mehr heute."
+        return "END", (f"{de_time(day, vs.LAST_ENTRY_SLOT, end=True)} Uhr vorbei: "
+                       "keine neuen Einstiege mehr heute.")
     if state["seen"] is None:
         # Started late: only the newest complete bar is fresh enough to act on.
         state["seen"] = complete - 1
@@ -107,6 +122,8 @@ def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades):
             continue
         sig = vs.pullback(session, k, vw, rr, min_risk)
         if sig and sig["side"] in sides and k == complete:
+            if history:
+                sig["context"] = vs.signal_context(history, day.isoformat(), session, sig)
             state["open"] = sig
             return "SIGNAL", signal_line(day, sig, state["bias"])
     return None
@@ -129,13 +146,18 @@ def cmd_next(args):
         yearly = [b for b in vs.fetch_yearly() if b["date"] < day.isoformat()]
         state["bias"] = vs.orb.market_regime(yearly[-30:])["bias"]
         save_state(state)
+    try:
+        history = {d: s for d, s in vs.fetch_60d(datetime.datetime.now(datetime.timezone.utc)).items()
+                   if d < day.isoformat()}
+    except Exception:  # the context is optional; signals go out without it
+        history = None
     while True:
         now = time.time()
         session, data_time = vs.fetch_today(day)
         complete = complete_slot(session, data_time, now)
         if complete >= 0:
             event = step(state, session, complete, day, args.trend_filter, args.rr, args.min_risk,
-                         args.max_trades)
+                         args.max_trades, history)
             save_state(state)
             if event:
                 print(f"{event[0]} {event[1]}")

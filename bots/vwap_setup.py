@@ -15,6 +15,11 @@ with o, h, l, c and v (5-minute bars). The rule, on a COMPLETE bar k:
 
 With the trend filter a day takes only the side of the daily trend (rising
 or falling 20-day average); a neutral day takes both.
+
+Each signal also carries context: the 15- and 45-minute trend and the
+volume against the usual for that time of day. Replayed as filters the
+higher timeframes did not help; calm volume did a little better, so it
+grades a signal's quality instead of dropping signals.
 """
 
 import datetime
@@ -199,3 +204,69 @@ def fetch_today(day):
             session[int(slot)] = {"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"],
                                   "v": b.get("v") or 0}
     return session, ch["data_time"]
+
+
+# ---------------------------------------------------------------- context: higher timeframes and volume
+
+def higher_bars(sessions, n, upto=None):
+    """Closes of n x 5-minute bars, aligned to 9:30, over sessions (oldest first).
+
+    upto=(date, slot) keeps only the bars complete by that 5-minute slot's close.
+    """
+    closes = []
+    for d in sorted(sessions):
+        s = sessions[d]
+        for start in range(0, 78, n):
+            last = start + n - 1
+            if upto and (d > upto[0] or (d == upto[0] and last > upto[1])):
+                return closes
+            if all(k in s for k in range(start, start + n)):
+                closes.append(s[last]["c"])
+    return closes
+
+
+def trend_of(closes, n=20):
+    """long, short or neutral: the last close against a rising or falling EMA."""
+    if len(closes) < n + 3:
+        return "neutral"
+    e, line = None, []
+    for c in closes:
+        e = c if e is None else e + 2 / (n + 1) * (c - e)
+        line.append(e)
+    if closes[-1] > line[-1] and line[-1] > line[-4]:
+        return "long"
+    if closes[-1] < line[-1] and line[-1] < line[-4]:
+        return "short"
+    return "neutral"
+
+
+def relative_volume(history, session, slot, days=20):
+    """A bar's volume against the same slot's average over the last days sessions."""
+    same = [s[slot].get("v") or 0 for s in [history[d] for d in sorted(history)][-days:] if slot in s]
+    avg = sum(same) / len(same) if same else 0
+    return (session[slot].get("v") or 0) / avg if avg and slot in session else None
+
+
+def opening_volume(history, session, bars=6, days=20):
+    """The first half hour's volume against its average over the last days sessions."""
+    first = lambda s: sum(s[k].get("v") or 0 for k in range(bars) if k in s)
+    prior = [first(history[d]) for d in sorted(history)[-days:]]
+    avg = sum(prior) / len(prior) if prior else 0
+    return first(session) / avg if avg and all(k in session for k in range(bars)) else None
+
+
+def signal_context(history, day, session, sig):
+    """15- and 45-minute trend, relative volume and a quality grade for a signal.
+
+    Quality is from the replay: signals on a calm bar (volume under the usual
+    for that time) and on a calm open did better. It grades, it does not filter.
+    """
+    sessions = {**history, day: session}
+    upto = (day, sig["slot"])
+    t15 = trend_of(higher_bars(sessions, 3, upto))
+    t45 = trend_of(higher_bars(sessions, 9, upto))
+    rv = relative_volume(history, session, sig["slot"])
+    ov = opening_volume(history, session)
+    calm = sum(1 for x in (rv, ov) if x is not None and x < 1.0)
+    quality = "hoch" if calm == 2 else "mittel" if calm == 1 else "normal"
+    return {"trend_15m": t15, "trend_45m": t45, "rel_volume": rv, "open_volume": ov, "quality": quality}

@@ -125,6 +125,20 @@ Eine Kerze zählt erst, wenn Yahoos Daten über ihr Ende hinausreichen. Ein Fehl
 durch eine halb fertige Kerze ist so ausgeschlossen. Die Kurse sind die des Index:
 Beim CFD übernimmst du Stop und Ziel als Abstand in Punkten.
 
+**Zeitebenen und Volumen:** Jedes Signal nennt den Trend auf 15 und 45 Minuten sowie das
+Volumen der Signalkerze und der ersten halben Stunde, verglichen mit dem Üblichen zur gleichen
+Uhrzeit. Daraus ergibt sich eine **Qualitätsstufe**:
+
+| Qualität | Bedeutung | im Rückblick |
+| --- | --- | --- |
+| HOCH | Signalkerze und Eröffnung auf ruhigem Volumen | Ø +0,52 R |
+| MITTEL | eins von beiden ruhig | Ø +0,09 R |
+| NORMAL | beides lebhaft | Ø +0,05 R |
+
+Als Filter brachten 15 und 45 Minuten im Test keinen Vorteil (45 Minuten: Ø +0,06 R statt +0,25 R).
+Deshalb stehen sie nur als Info im Signal. Die Qualitätsstufe filtert ebenfalls nicht, damit keine
+Trades verloren gehen. Bei MITTEL und NORMAL kann man aber kleiner handeln.
+
 **Hebel und Größe:** Der Hebel (zum Beispiel 1:20) legt nur die Margin fest, nicht das Risiko.
 Das Risiko bestimmt die Größe: Bei 1 % Risiko pro Trade und einem typischen Stop von 27 Punkten
 sind es je 10 € Risiko etwa 0,37 Kontrakte, wenn ein Punkt bei Größe 1 einen Euro wert ist.

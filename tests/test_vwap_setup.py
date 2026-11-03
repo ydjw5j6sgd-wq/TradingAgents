@@ -107,3 +107,47 @@ def test_complete_slot_needs_yahoo_data_past_the_bar_end():
     assert ls.complete_slot(s, data_time=1650, now=2000) == 1
     assert ls.complete_slot(s, data_time=1500, now=2000) == 0
     assert ls.complete_slot(s, data_time=1200, now=2000) == -1
+
+
+def flat_session(close=100.0, vol=100):
+    return {k: bar(close, close + 1, close - 1, close, vol) for k in range(78)}
+
+
+def test_higher_bars_stop_at_the_signal_and_skip_incomplete_groups():
+    sessions = {"2026-11-02": flat_session(), "2026-11-03": {k: bar(0, 1, 0, k) for k in range(10)}}
+    closes = vs.higher_bars(sessions, 3, upto=("2026-11-03", 7))
+    assert closes[-2:] == [2, 5] and len(closes) == 26 + 2
+    assert len(vs.higher_bars(sessions, 9)) == 8 + 1
+
+
+def test_trend_of_needs_a_sloping_ema():
+    assert vs.trend_of(list(range(40))) == "long"
+    assert vs.trend_of(list(range(40, 0, -1))) == "short"
+    assert vs.trend_of([5] * 40) == "neutral"
+    assert vs.trend_of([1, 2, 3]) == "neutral"
+
+
+def test_volume_is_compared_with_the_same_time_of_day():
+    history = {f"2026-10-{d:02d}": flat_session(vol=100) for d in range(1, 21)}
+    today = flat_session(vol=50)
+    assert vs.relative_volume(history, today, 10) == pytest.approx(0.5)
+    assert vs.opening_volume(history, today) == pytest.approx(0.5)
+    ctx = vs.signal_context(history, "2026-10-21", today, {"slot": 10})
+    assert ctx["quality"] == "hoch" and ctx["trend_15m"] == "neutral"
+    busy = vs.signal_context(history, "2026-10-21", flat_session(vol=300), {"slot": 10})
+    assert busy["quality"] == "normal"
+
+
+def test_signal_line_shows_the_context():
+    sig = {"slot": 8, "side": "SELL", "entry": 100.0, "stop": 110.0, "target": 85.0, "risk": 10.0,
+           "rr": 1.5, "vwap": 101.0, "context": {"trend_15m": "long", "trend_45m": "short",
+                                                  "rel_volume": 0.74, "open_volume": None, "quality": "mittel"}}
+    line = ls.signal_line(DAY, sig, "short")
+    assert "15 Min aufwärts, 45 Min abwärts" in line and "Signalkerze 0,7x" in line
+    assert "Eröffnung ?" in line and "Qualität MITTEL" in line and "Tagestrend abwärts" in line
+
+
+def test_end_of_entries_uses_the_day_s_german_time():
+    late = {"date": "2026-10-28", "bias": "long", "seen": 66, "open": None, "trades": []}
+    # in the week Europe has left summer time and the US has not, entries end at 20:05
+    assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28), True, 1.5, 15, 3)[1].startswith("20:05 Uhr")

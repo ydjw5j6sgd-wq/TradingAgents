@@ -97,3 +97,19 @@ def test_chart_context_needs_enough_bars_and_applies_the_basis():
     bars = [{"h": 1010 + i, "l": 1000 + i, "c": 1005 + i} for i in range(80)]
     ctx = mb.chart_context(bars, 100.0, None)
     assert ctx["price"] == 984 and ctx["ema_rising"] and ctx["poc"] is None
+
+
+def flat(close=100.0, vol=100, n=78):
+    return {k: {"o": close, "h": close + 1, "l": close - 1, "c": close, "v": vol} for k in range(n)}
+
+
+def test_timeframes_read_the_last_session_and_its_volume():
+    sessions = {f"2026-10-{d:02d}": flat() for d in range(1, 21)}
+    sessions["2026-10-21"] = {k: {"o": k, "h": k + 1, "l": k - 1, "c": float(k), "v": 200} for k in range(78)}
+    tf = mb.timeframes(sessions)
+    assert tf["5m"] == "long" and tf["15m"] == "long" and tf["volume"] == pytest.approx(2.0)
+    assert mb.timeframes({}) is None
+
+
+def test_quality_record_groups_by_grade():
+    assert mb.quality_record({"2026-10-01": flat()}, {}) == {}

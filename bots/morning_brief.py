@@ -164,6 +164,36 @@ def chart_context(h4, basis, prev_session):
             "poc": point_of_control(prev_session) if prev_session else None}
 
 
+def timeframes(sessions):
+    """5-, 15- and 45-minute trend at the last close, and that session's volume against the
+    average of the 20 before it."""
+    if not sessions:
+        return None
+    order = sorted(sessions)
+    last = sessions[order[-1]]
+    total = lambda s: sum(b.get("v") or 0 for b in s.values())
+    prior = [total(sessions[d]) for d in order[-21:-1]]
+    avg = sum(prior) / len(prior) if prior else 0
+    return {"5m": vs.trend_of([last[k]["c"] for k in sorted(last)]),
+            "15m": vs.trend_of(vs.higher_bars(sessions, 3)),
+            "45m": vs.trend_of(vs.higher_bars(sessions, 9)),
+            "volume": total(last) / avg if avg else None}
+
+
+def quality_record(sessions, biases, cost=2.0):
+    """Average R (net of cost) of the filtered signals by quality grade."""
+    order = sorted(sessions)
+    out = {}
+    for i, d in enumerate(order):
+        if len(sessions[d]) < 70:
+            continue
+        history = {x: sessions[x] for x in order[max(0, i - 25):i]}
+        for t in vs.scan_session(sessions[d], biases.get(d, "neutral"), True):
+            grade = vs.signal_context(history, d, sessions[d], t)["quality"]
+            out.setdefault(grade, []).append(t["r"] - cost / t["risk"])
+    return {g: {"trades": len(rs), "avg_r": round(sum(rs) / len(rs), 2)} for g, rs in out.items()}
+
+
 def brief(days, yearly, future, today, h4=None, basis=0.0):
     past = [b for b in yearly if b["date"] < today.isoformat()]
     regime = orb.market_regime(past[-30:])
@@ -185,6 +215,8 @@ def brief(days, yearly, future, today, h4=None, basis=0.0):
             "plan": plan(today, filtered["median_risk"] or unfiltered["median_risk"] or 25.0),
             "replay": {"with_filter": filtered, "without_filter": unfiltered},
             "events": event_hints(today),
+            "timeframes": timeframes(sessions),
+            "quality": quality_record(sessions, biases),
             "chart": chart_context(h4 or [], basis, sessions[max(sessions)] if sessions else None)}
 
 
@@ -233,6 +265,21 @@ def german(b):
                          f"{num(st['avg_r'], 2)} R, längste Verlustserie {st['worst_streak']}")
         else:
             lines.append(f"- {name}: keine Trades")
+    grades = b.get("quality") or {}
+    if grades:
+        parts = [f"{g} Ø {'+' if grades[g]['avg_r'] >= 0 else ''}{num(grades[g]['avg_r'], 2)} R "
+                 f"({grades[g]['trades']})" for g in ("hoch", "mittel", "normal") if g in grades]
+        lines.append("- Nach Qualität (Volumen ruhig = hoch): " + ", ".join(parts))
+    tf = b.get("timeframes")
+    if tf:
+        words = {"long": "aufwärts", "short": "abwärts", "neutral": "seitwärts"}
+        lines += ["", "Zeitebenen und Volumen (zum Vortagesschluss)",
+                  f"- 5 Min {words[tf['5m']]}, 15 Min {words[tf['15m']]}, 45 Min {words[tf['45m']]}"]
+        if tf["volume"] is not None:
+            lines.append(f"- Vortagsvolumen {num(tf['volume'], 1)}x des 20-Tage-Schnitts"
+                         + (" (lebhaft)" if tf["volume"] >= 1.2 else " (ruhig)" if tf["volume"] < 0.8 else ""))
+        lines.append("- Live-Signale nennen 15/45 Min und Volumen mit; als Filter brachten die Zeitebenen "
+                     "im Test keinen Vorteil, ruhiges Volumen schon.")
     ch = b.get("chart")
     if ch:
         trend = {"long": "bullisch", "short": "bärisch", "neutral": "ohne klare Richtung"}[ch["bias"]]
