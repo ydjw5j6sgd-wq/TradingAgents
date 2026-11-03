@@ -192,3 +192,56 @@ def test_live_sends_one_move_push_then_closes_on_the_trailed_stop():
     s[10] = bar(200, 201, 150, 160)
     kind, line = ls.step(state, s, 10, DAY, True, 2.0, 15, 6)
     assert kind == "CLOSED" and "nachgezogener Stop erreicht" in line and state["trades"][0]["r"] > 0
+
+
+def quiet_history(vol=100, days=20):
+    return {f"2026-10-{d:02d}": flat_session(vol=vol) for d in range(1, days + 1)}
+
+
+def test_sweep_sells_a_failed_break_of_the_hour_high_on_heavy_volume():
+    s = {k: bar(100, 110, 90, 100) for k in range(20)}
+    s[20] = bar(105, 130, 100, 101, v=200)  # runs 110, closes back under it and under its open
+    sig = vs.sweep(s, 20, quiet_history())
+    assert sig["side"] == "SELL" and sig["level"] == 110 and sig["volume"] == pytest.approx(2.0)
+    assert sig["stop"] == pytest.approx(133) and sig["setup"] == "sweep"
+
+
+def test_sweep_needs_the_volume_and_the_close_back_inside():
+    s = {k: bar(100, 110, 90, 100) for k in range(20)}
+    s[20] = bar(105, 130, 100, 101, v=100)
+    assert vs.sweep(s, 20, quiet_history()) is None  # usual volume
+    s[20] = bar(105, 130, 100, 115, v=200)
+    assert vs.sweep(s, 20, quiet_history()) is None  # closed above the old high: a breakout
+    s[20] = bar(95, 100, 70, 96, v=200)
+    assert vs.sweep(s, 20, quiet_history())["side"] == "BUY"
+    assert vs.sweep(s, 20, None) is None
+
+
+def test_volume_levels_find_poc_value_area_and_spaced_clusters():
+    s1 = {0: bar(0, 101, 99, 100, 500), 1: bar(0, 111, 109, 110, 300), 2: bar(0, 201, 199, 200, 400),
+          3: bar(0, 91, 89, 90, 50)}
+    lv = vs.volume_levels([s1], share=0.5)
+    assert (lv["poc"], lv["val"], lv["vah"]) == (100, 100, 110)
+    assert lv["nodes"] == [100, 200]  # 110 is no peak of its own and sits too close to 100
+    assert vs.nearest_clusters(lv, 150) == (200, 110)
+    assert vs.volume_levels([]) is None and vs.nearest_clusters(None, 1) == (None, None)
+
+
+def test_live_follows_an_open_signal_on_one_minute_bars():
+    s = rising()
+    s[8] = bar(150, 185, 120, 182)
+    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
+    assert ls.step(state, s, 8, DAY, False, 2.0, 15, 6, minutes=[])[0] == "SIGNAL"
+    open_ts = datetime.datetime.combine(DAY, datetime.time(9, 30), tzinfo=ls.NY).timestamp()
+    entry_end = open_ts + 9 * 300
+    minutes = [(entry_end, bar(182, 183, 100, 101))]  # the stop in the first minute after the entry
+    kind, line = ls.step(state, s, 8, DAY, False, 2.0, 15, 6, minutes=minutes)
+    assert kind == "CLOSED" and "STOP erreicht um 16:16 Uhr" in line
+
+
+def test_signal_line_describes_a_sweep_and_the_clusters():
+    sig = {"slot": 20, "side": "SELL", "entry": 101.0, "stop": 133.0, "target": 37.0, "risk": 32.0,
+           "rr": 2.0, "level": 110.0, "volume": 2.0, "setup": "sweep", "clusters": (150.0, None)}
+    line = ls.signal_line(DAY, sig, "long")
+    assert "Fehlausbruch" in line and "die Käufer verlieren den Boden" in line
+    assert "(gegen den Trend)" in line and "Volumen-Cluster: darüber 150,0." in line

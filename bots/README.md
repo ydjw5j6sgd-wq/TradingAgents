@@ -104,20 +104,35 @@ Für den täglichen Handel im Nasdaq 100 gibt es ein eigenes Setup, den **VWAP-P
 - **Vor 16:10 Uhr gibt es keine Signale.** Auf dem Nasdaq-100-Future verlor der VWAP-Pullback in
   der europäischen Sitzung (9:00 bis 15:25 Uhr) in jeder getesteten Variante (Ø −0,17 bis −0,42 R).
   Eine Rückkehr zum VWAP und der Ausbruch aus der Nacht-Range lagen bei etwa null.
-- **Trendfilter (Standard):** Im Aufwärtstrend nur BUY, im Abwärtstrend nur SELL,
-  in einer Seitwärtsphase beides. Mit `--no-trend-filter` kommen beide Richtungen, also mehr Signale.
+- **Zweites Setup: Fehlausbruch.** Eine Kerze sticht über das Hoch (unter das Tief) der letzten Stunde,
+  bei mindestens 1,2-fachem Volumen für diese Uhrzeit, schließt aber wieder darunter (darüber) und gegen
+  ihre Eröffnung. Die Käufer (Verkäufer), die den Ausbruch gekauft haben, verlieren den Boden: SELL (BUY),
+  Stop knapp hinter der Kerze, gleiches Nachziehen.
+- **Beide Richtungen (Standard).** Jedes Signal sagt, ob es mit oder gegen den Tagestrend läuft.
+  Mit `--trend-filter` kommen nur Signale in Trendrichtung.
+- **Schnell:** Ein offenes Signal wird auf 1-Minuten-Kerzen verfolgt, und alle 20 Sekunden wird geprüft.
+  Der Push kommt so etwa eine halbe Minute nach Kerzenschluss. Yahoo-Daten sind kostenlos und können
+  sich verzögern.
+- **Volumen-Cluster:** Jedes Signal nennt den nächsten Cluster darüber und darunter (Volume Profile
+  der letzten 3 Tage und des laufenden Tages). Dort treffen Käufer und Verkäufer aufeinander.
 
 Im Rückblick über 59 Handelstage, mit 2 Punkten Spread pro Trade:
 
 | | Trades/Tag | Treffer | Ø pro Trade | längste Verlustserie |
 | --- | --- | --- | --- |
-| mit Trendfilter, Stop nachziehen | 0,7 | 74 % | +0,29 R | 2 |
-| ohne Trendfilter, Stop nachziehen | 1,2 | 67 % | +0,23 R | 2 |
+| **VWAP + Fehlausbruch, beide Richtungen (Standard)** | 1,9 | 66 % | +0,17 R | 4 |
+| VWAP + Fehlausbruch, nur mit dem Trend | 1,1 | 74 % | +0,31 R | 2 |
+| nur VWAP, mit Trendfilter, Stop nachziehen | 0,7 | 74 % | +0,29 R | 2 |
+| nur VWAP, ohne Trendfilter, Stop nachziehen | 1,2 | 67 % | +0,23 R | 2 |
 | zum Vergleich: Stop bleibt, Ziel 1,5R, mit Trendfilter | 0,6 | 53 % | +0,25 R | 5 |
 
 Die Regel zum Nachziehen wurde auf der ersten Hälfte des Zeitraums gewählt und auf der zweiten
 geprüft: Die Trefferquote lag dort bei 68 % bzw. 82 %. Rund ein Drittel der Gewinner sind
 allerdings Mini-Gewinne: Der Kurs drehte, nachdem der Stop schon auf Einstand stand.
+
+Getestet und verworfen: der Bruch eines Volumen-Clusters mit Volumen (−0,03 R, instabil) und die
+Rückkehr in die Value Area des Vortags (−0,48 R). Der Fehlausbruch allein lag bei +0,05 R; zusammen
+mit dem VWAP-Pullback bringt er mehr Trades und mehr Summe (+18,7 R statt +15,9 R).
 
 Zum Vergleich lag der Opening-Range-Ausbruch des Capital.com-Bots über denselben Zeitraum bei −0,26 R.
 Beide VWAP-Varianten waren in der ersten Hälfte des Zeitraums bei null oder im Minus.
@@ -125,8 +140,8 @@ Garantiert ist also nichts.
 
 ```bash
 python3 bots/morning_brief.py                       # Morgenanalyse: BUY, SELL, BEIDE oder ABWARTEN
-python3 bots/live_signals.py next                   # wartet aufs nächste Signal (mit Trendfilter)
-python3 bots/live_signals.py next --no-trend-filter # beide Richtungen
+python3 bots/live_signals.py next                   # wartet aufs nächste Ereignis (beide Richtungen)
+python3 bots/live_signals.py next --trend-filter    # nur Signale in Trendrichtung
 python3 bots/live_signals.py status                 # Signale von heute
 ```
 

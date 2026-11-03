@@ -44,6 +44,10 @@ LOOK = 6            # VWAP slope over six bars (30 minutes)
 TARGET_R = 2.0      # target in R
 BE_AT = 0.5         # at +0.5 R the stop moves to the entry (plus 0.1 R)
 TRAIL = 0.5         # and then trails 0.5 R behind the best price
+SWEEP_LOOK = 12     # a sweep runs the high or low of the last hour (12 bars)
+SWEEP_VOLUME = 1.2  # on at least 1.2 times the usual volume for that time of day
+SETUPS = ("vwap", "sweep")
+SETUP_NAMES = {"vwap": "VWAP-Pullback", "sweep": "Fehlausbruch"}
 SIDE_OF_BIAS = {"long": {"BUY"}, "short": {"SELL"}, "neutral": {"BUY", "SELL"}}
 
 
@@ -88,32 +92,64 @@ def pullback(session, k, vw=None, rr=1.5, min_risk=15.0):
         return None
     target = b["c"] + rr * risk if side == "BUY" else b["c"] - rr * risk
     return {"slot": k, "side": side, "entry": b["c"], "stop": stop, "target": target,
-            "risk": risk, "rr": rr, "vwap": vw[k]}
+            "risk": risk, "rr": rr, "vwap": vw[k], "setup": "vwap"}
 
 
-def follow(session, sig, last_slot=FLAT_SLOT, be_at=None, trail=None, flat=True):
-    """Follow a signal bar by bar after its entry, up to last_slot.
+def sweep(session, k, history, rr=2.0, min_risk=15.0, look=SWEEP_LOOK, vol_x=SWEEP_VOLUME):
+    """A failed breakout on bar k, or None: the bar runs the last hour's high (low) on
+    heavy volume but closes back under (over) it and against its open, so the buyers
+    (sellers) who chased the break are trapped. SELL (BUY), stop beyond the bar."""
+    b = session.get(k)
+    prev = [session[j] for j in range(k - look, k) if j in session]
+    if b is None or len(prev) < look or not history:
+        return None
+    rv = relative_volume(history, session, k)
+    if rv is None or rv < vol_x:
+        return None
+    hi, lo = max(x["h"] for x in prev), min(x["l"] for x in prev)
+    span = b["h"] - b["l"]
+    if b["h"] > hi and b["c"] < hi and b["c"] < b["o"]:
+        side, stop, level = "SELL", b["h"] + 0.1 * span, hi
+    elif b["l"] < lo and b["c"] > lo and b["c"] > b["o"]:
+        side, stop, level = "BUY", b["l"] - 0.1 * span, lo
+    else:
+        return None
+    risk = abs(b["c"] - stop)
+    if risk < min_risk:
+        return None
+    target = b["c"] + rr * risk if side == "BUY" else b["c"] - rr * risk
+    return {"slot": k, "side": side, "entry": b["c"], "stop": stop, "target": target, "risk": risk,
+            "rr": rr, "level": level, "volume": rv, "setup": "sweep"}
+
+
+def signal_at(session, k, vw, history, setups=SETUPS, rr=2.0, min_risk=15.0):
+    """The first setup that fires on bar k: the VWAP pullback before the sweep."""
+    sig = pullback(session, k, vw, rr, min_risk) if "vwap" in setups else None
+    if sig is None and "sweep" in setups:
+        sig = sweep(session, k, history, rr, min_risk)
+    return sig
+
+
+def walk(bars, sig, be_at=None, trail=None):
+    """Follow a signal over bars after its entry: an iterable of (key, bar) in time order.
 
     be_at: once the best price is be_at R in profit, the stop moves to the
     entry plus a tenth of the risk; trail: from then on it follows the best
     price trail R behind. The stop is checked before the target, and a bar
     only moves the stop for the bars after it. Returns a dict with result
-    ("stop", "trail" for a moved stop, "target", "flat", or None while
-    open), r, slot, the current stop and whether it has moved.
+    ("stop", "trail" for a moved stop, "target", or None while open), r,
+    key, the current stop, whether it has moved, and the last (key, close).
     """
     long = sig["side"] == "BUY"
     entry, risk = sig["entry"], sig["risk"]
     stop, best, moved, last = sig["stop"], entry, False, None
-    for k in range(sig["slot"] + 1, min(last_slot, FLAT_SLOT) + 1):
-        b = session.get(k)
-        if b is None:
-            continue
+    for key, b in bars:
         if (long and b["l"] <= stop) or (not long and b["h"] >= stop):
             r = (stop - entry) / risk if long else (entry - stop) / risk
-            return {"result": "trail" if moved else "stop", "r": -1.0 if not moved else r, "slot": k,
-                    "stop": stop, "moved": moved}
+            return {"result": "trail" if moved else "stop", "r": r if moved else -1.0, "key": key,
+                    "stop": stop, "moved": moved, "last": last}
         if (long and b["h"] >= sig["target"]) or (not long and b["l"] <= sig["target"]):
-            return {"result": "target", "r": sig["rr"], "slot": k, "stop": stop, "moved": moved}
+            return {"result": "target", "r": sig["rr"], "key": key, "stop": stop, "moved": moved, "last": last}
         best = max(best, b["h"]) if long else min(best, b["l"])
         gain = (best - entry) / risk if long else (entry - best) / risk
         if be_at is not None and not moved and gain >= be_at:
@@ -121,11 +157,21 @@ def follow(session, sig, last_slot=FLAT_SLOT, be_at=None, trail=None, flat=True)
             stop = entry + 0.1 * risk if long else entry - 0.1 * risk
         if moved and trail is not None:
             stop = max(stop, best - trail * risk) if long else min(stop, best + trail * risk)
-        last = (k, b["c"])
-    if flat and last_slot >= FLAT_SLOT and last:
-        move = last[1] - entry if long else entry - last[1]
-        return {"result": "flat", "r": move / risk, "slot": last[0], "stop": stop, "moved": moved}
-    return {"result": None, "r": None, "slot": None, "stop": stop, "moved": moved}
+        last = (key, b["c"])
+    return {"result": None, "r": None, "key": None, "stop": stop, "moved": moved, "last": last}
+
+
+def follow(session, sig, last_slot=FLAT_SLOT, be_at=None, trail=None, flat=True):
+    """walk() over a session's 5-minute bars up to last_slot, closing at the flat-by bar.
+    Returns the walk's dict with the bar's slot as "slot"."""
+    bars = ((k, session[k]) for k in range(sig["slot"] + 1, min(last_slot, FLAT_SLOT) + 1) if k in session)
+    f = walk(bars, sig, be_at, trail)
+    if f["result"] is None and flat and last_slot >= FLAT_SLOT and f["last"]:
+        k, close = f["last"]
+        move = close - sig["entry"] if sig["side"] == "BUY" else sig["entry"] - close
+        f.update(result="flat", r=move / sig["risk"], key=k)
+    f["slot"] = f["key"]
+    return f
 
 
 def outcome(session, sig, last_slot=FLAT_SLOT, flat=True):
@@ -134,16 +180,17 @@ def outcome(session, sig, last_slot=FLAT_SLOT, flat=True):
     return f["result"], f["r"], f["slot"]
 
 
-def scan_session(session, bias="neutral", trend_filter=True, rr=TARGET_R, min_risk=15.0, max_trades=6,
-                 max_losses=3, be_at=BE_AT, trail=TRAIL):
-    """Every trade the rules take in one full session, one at a time, pausing after max_losses."""
+def scan_session(session, bias="neutral", trend_filter=False, rr=TARGET_R, min_risk=15.0, max_trades=6,
+                 max_losses=3, be_at=BE_AT, trail=TRAIL, history=None, setups=SETUPS):
+    """Every trade the rules take in one full session, one at a time, pausing after max_losses.
+    The sweep needs history (earlier sessions) for its volume check."""
     vw = session_vwap(session)
     sides = SIDE_OF_BIAS[bias] if trend_filter else SIDE_OF_BIAS["neutral"]
     trades, busy = [], -1
     for k in range(FIRST_SLOT, LAST_ENTRY_SLOT + 1):
         if k <= busy or len(trades) >= max_trades or sum(t["r"] < 0 for t in trades) >= max_losses:
             continue
-        sig = pullback(session, k, vw, rr, min_risk)
+        sig = signal_at(session, k, vw, history, setups, rr, min_risk)
         if sig is None or sig["side"] not in sides:
             continue
         f = follow(session, sig, be_at=be_at, trail=trail)
@@ -163,17 +210,19 @@ def bias_by_date(dates, yearly):
     return out
 
 
-def backtest(days, biases, trend_filter=True, rr=TARGET_R, min_risk=15.0, max_trades=6, cost=2.0,
-             be_at=BE_AT, trail=TRAIL):
+def backtest(days, biases, trend_filter=False, rr=TARGET_R, min_risk=15.0, max_trades=6, cost=2.0,
+             be_at=BE_AT, trail=TRAIL, setups=SETUPS):
     """Stats over full sessions; each trade's R net of cost points."""
     rs, risks, per_side = [], [], {"BUY": [], "SELL": []}
     sessions = 0
-    for d in sorted(days):
+    order = sorted(days)
+    for i, d in enumerate(order):
         if len(days[d]) < 70:
             continue
         sessions += 1
+        history = {x: days[x] for x in order[max(0, i - 20):i]}
         for t in scan_session(days[d], biases.get(d, "neutral"), trend_filter, rr, min_risk, max_trades,
-                              be_at=be_at, trail=trail):
+                              be_at=be_at, trail=trail, history=history, setups=setups):
             r = t["r"] - cost / t["risk"]
             rs.append(r)
             risks.append(t["risk"])
@@ -301,3 +350,53 @@ def signal_context(history, day, session, sig):
     calm = sum(1 for x in (rv, ov) if x is not None and x < 1.0)
     quality = "hoch" if calm == 2 else "mittel" if calm == 1 else "normal"
     return {"trend_15m": t15, "trend_45m": t45, "rel_volume": rv, "open_volume": ov, "quality": quality}
+
+
+def volume_levels(sessions, step=10, share=0.7, nodes=3, gap=50):
+    """Volume profile over sessions: point of control, value area (share of the volume
+    around it) and the strongest clusters (high-volume nodes, at least gap points
+    apart), in step-point bins."""
+    profile = {}
+    for sess in sessions:
+        for b in sess.values():
+            level = round((b["h"] + b["l"] + b["c"]) / 3 / step) * step
+            profile[level] = profile.get(level, 0) + (b.get("v") or 0)
+    if not profile or not sum(profile.values()):
+        return None
+    poc = max(profile, key=profile.get)
+    lo = hi = poc
+    acc, total = profile[poc], sum(profile.values())
+    while acc < share * total:
+        up, down = profile.get(hi + step, 0), profile.get(lo - step, 0)
+        if up == down == 0:
+            break
+        if up >= down:
+            hi += step
+            acc += up
+        else:
+            lo -= step
+            acc += down
+    # clusters: local volume peaks, strongest first
+    peaks = [l for l in profile if profile[l] >= profile.get(l - step, 0) and profile[l] >= profile.get(l + step, 0)]
+    picked = []
+    for level in sorted(peaks, key=profile.get, reverse=True):
+        if all(abs(level - other) >= gap for other in picked):
+            picked.append(level)
+    return {"poc": poc, "val": lo, "vah": hi, "nodes": picked[:nodes]}
+
+
+def nearest_clusters(levels, price):
+    """The closest volume cluster (node, POC or value-area edge) above and below the price."""
+    if not levels:
+        return None, None
+    marks = set(levels["nodes"]) | {levels["poc"], levels["val"], levels["vah"]}
+    above = [m for m in marks if m > price]
+    below = [m for m in marks if m < price]
+    return (min(above) if above else None), (max(below) if below else None)
+
+
+def fetch_minutes(day):
+    """Today's ^NDX 1-minute bars as (start epoch, bar), oldest first."""
+    _, entry = tools()
+    ch = entry.get_chart("^NDX", "1m")
+    return [(b["t"], {"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]}) for b in ch["bars"]]

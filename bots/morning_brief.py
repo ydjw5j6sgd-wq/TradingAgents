@@ -181,14 +181,14 @@ def timeframes(sessions):
 
 
 def quality_record(sessions, biases, cost=2.0):
-    """Average R (net of cost) of the filtered signals by quality grade."""
+    """Average R (net of cost) of the live default's signals (both setups, no trend filter) by grade."""
     order = sorted(sessions)
     out = {}
     for i, d in enumerate(order):
         if len(sessions[d]) < 70:
             continue
         history = {x: sessions[x] for x in order[max(0, i - 25):i]}
-        for t in vs.scan_session(sessions[d], biases.get(d, "neutral"), True):
+        for t in vs.scan_session(sessions[d], biases.get(d, "neutral"), False, history=history):
             grade = vs.signal_context(history, d, sessions[d], t)["quality"]
             out.setdefault(grade, []).append(t["r"] - cost / t["risk"])
     return {g: {"trades": len(rs), "avg_r": round(sum(rs) / len(rs), 2)} for g, rs in out.items()}
@@ -212,12 +212,13 @@ def brief(days, yearly, future, today, h4=None, basis=0.0):
             "levels": {"prev_close": prev["close"], "prev_high": prev["high"], "prev_low": prev["low"],
                        "five_day_high": max(b["high"] for b in five),
                        "five_day_low": min(b["low"] for b in five), "atr": regime["atr"], "est_open": est_open},
-            "plan": plan(today, filtered["median_risk"] or unfiltered["median_risk"] or 25.0),
+            "plan": plan(today, unfiltered["median_risk"] or filtered["median_risk"] or 25.0),
             "replay": {"with_filter": filtered, "without_filter": unfiltered},
             "events": event_hints(today),
             "timeframes": timeframes(sessions),
             "quality": quality_record(sessions, biases),
-            "chart": chart_context(h4 or [], basis, sessions[max(sessions)] if sessions else None)}
+            "chart": chart_context(h4 or [], basis, sessions[max(sessions)] if sessions else None),
+            "clusters": vs.volume_levels([sessions[d] for d in sorted(sessions)[-3:]]) if sessions else None}
 
 
 def num(x, digits=1):
@@ -247,7 +248,7 @@ def german(b):
                      f"um {num(lv['est_open']['level'])}")
     lines += [
         "",
-        "Plan: VWAP-Pullback",
+        "Plan: VWAP-Pullback und Fehlausbruch, beide Richtungen",
         f"- US-Börse ab {pl['open_de']} Uhr, Signale von {pl['first_signal_de']} bis {pl['last_signal_de']} Uhr, "
         f"glattstellen bis {pl['flat_de']} Uhr, max. 6 Signale, Pause nach 3 Verlusten",
         f"- Typischer Stop ~{num(pl['stop_pts'], 0)} Punkte, Ziel ~{num(pl['target_pts'], 0)} Punkte, "
@@ -259,7 +260,7 @@ def german(b):
         "",
         "Rückblick (Spread 2 Punkte eingerechnet)",
     ]
-    for key, name in (("with_filter", "Mit Trendfilter"), ("without_filter", "Ohne Trendfilter")):
+    for key, name in (("without_filter", "Live-Standard, beide Richtungen"), ("with_filter", "Nur mit dem Trend")):
         st = b["replay"][key]
         if st["trades"]:
             lines.append(f"- {name}: {st['trades']} Trades in {st['sessions']} Tagen ({num(st['per_day'])}/Tag), "
@@ -298,6 +299,14 @@ def german(b):
             lines.append(f"- Nächste Unterstützung {num(ch['support'])}")
         if ch["poc"] is not None:
             lines.append(f"- Vortags-POC (meistes Volumen): {num(ch['poc'], 0)}")
+    cl = b.get("clusters")
+    if cl:
+        lines += ["", "Volumen-Cluster der letzten 3 Tage (hier wurde am meisten gehandelt)",
+                  f"- POC {num(cl['poc'], 0)}, Value Area {num(cl['val'], 0)} bis {num(cl['vah'], 0)}",
+                  f"- Stärkste Cluster: {', '.join(num(n, 0) for n in cl['nodes'])}",
+                  "- An Clustern treffen Käufer und Verkäufer aufeinander: oft Bremse für den Kurs. Ein Bruch "
+                  "mit Volumen zeigt, wo eine Seite den Boden verliert; als eigenes Signal brachte das im Test "
+                  "nichts, nutze die Cluster als Orientierung für Ziel und Stop."]
         lines.append("- Nur zur Orientierung: Als Filter brachten diese Werte im Test keinen Vorteil.")
     if b["events"]:
         lines += ["", "Termine"] + [f"- {e}" for e in b["events"]]
