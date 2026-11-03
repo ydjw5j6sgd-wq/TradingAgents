@@ -97,7 +97,10 @@ Für den täglichen Handel im Nasdaq 100 gibt es ein eigenes Setup, den **VWAP-P
 - **SELL:** spiegelbildlich unter einem fallenden VWAP.
 - **Ziel:** 1,5-mal das Risiko. Stops unter 15 Punkten werden ausgelassen, die frisst der Spread.
 - Signale kommen von 16:10 bis 21:05 Uhr deutscher Zeit, immer nur eine offene Position,
-  höchstens 3 pro Tag. Glattgestellt wird bis 21:55 Uhr.
+  höchstens 6 pro Tag. Nach 3 Verlusten ist für den Tag Pause. Glattgestellt wird bis 21:55 Uhr.
+- **Vor 16:10 Uhr gibt es keine Signale.** Auf dem Nasdaq-100-Future verlor der VWAP-Pullback in
+  der europäischen Sitzung (9:00 bis 15:25 Uhr) in jeder getesteten Variante (Ø −0,17 bis −0,42 R).
+  Eine Rückkehr zum VWAP und der Ausbruch aus der Nacht-Range lagen bei etwa null.
 - **Trendfilter (Standard):** Im Aufwärtstrend nur BUY, im Abwärtstrend nur SELL,
   in einer Seitwärtsphase beides. Mit `--no-trend-filter` kommen beide Richtungen, also mehr Signale.
 

@@ -249,7 +249,7 @@ def german(b):
         "",
         "Plan: VWAP-Pullback",
         f"- US-Börse ab {pl['open_de']} Uhr, Signale von {pl['first_signal_de']} bis {pl['last_signal_de']} Uhr, "
-        f"glattstellen bis {pl['flat_de']} Uhr, max. 3 Signale",
+        f"glattstellen bis {pl['flat_de']} Uhr, max. 6 Signale, Pause nach 3 Verlusten",
         f"- Typischer Stop ~{num(pl['stop_pts'], 0)} Punkte, Ziel ~{num(pl['target_pts'], 0)} Punkte, "
         f"CRV {num(pl['rr'])} : 1",
         f"- Größe: je 10 € Risiko etwa {num(pl['size_per_10_eur'], 2)} Kontrakte "

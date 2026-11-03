@@ -11,7 +11,8 @@ with o, h, l, c and v (5-minute bars). The rule, on a COMPLETE bar k:
   are skipped: the spread would eat them.
 - Signals on the bars from 10:05 to 15:00 New York, so from 16:10 to 21:05
   German time when they close; one position at a time, at most max_trades
-  a day, flat by 15:55 New York (21:55 in Germany).
+  a day (6), a pause for the day after 3 losses, flat by 15:55 New York
+  (21:55 in Germany).
 
 With the trend filter a day takes only the side of the daily trend (rising
 or falling 20-day average); a neutral day takes both.
@@ -106,13 +107,14 @@ def outcome(session, sig, last_slot=FLAT_SLOT, flat=True):
     return None, None, None
 
 
-def scan_session(session, bias="neutral", trend_filter=True, rr=1.5, min_risk=15.0, max_trades=3):
-    """Every trade the rules take in one full session, one at a time."""
+def scan_session(session, bias="neutral", trend_filter=True, rr=1.5, min_risk=15.0, max_trades=6,
+                 max_losses=3):
+    """Every trade the rules take in one full session, one at a time, pausing after max_losses."""
     vw = session_vwap(session)
     sides = SIDE_OF_BIAS[bias] if trend_filter else SIDE_OF_BIAS["neutral"]
     trades, busy = [], -1
     for k in range(FIRST_SLOT, LAST_ENTRY_SLOT + 1):
-        if k <= busy or len(trades) >= max_trades:
+        if k <= busy or len(trades) >= max_trades or sum(t["r"] < 0 for t in trades) >= max_losses:
             continue
         sig = pullback(session, k, vw, rr, min_risk)
         if sig is None or sig["side"] not in sides:
@@ -134,7 +136,7 @@ def bias_by_date(dates, yearly):
     return out
 
 
-def backtest(days, biases, trend_filter=True, rr=1.5, min_risk=15.0, max_trades=3, cost=2.0):
+def backtest(days, biases, trend_filter=True, rr=1.5, min_risk=15.0, max_trades=6, cost=2.0):
     """Stats over full sessions; each trade's R net of cost points."""
     rs, risks, per_side = [], [], {"BUY": [], "SELL": []}
     sessions = 0

@@ -96,8 +96,14 @@ def test_live_step_respects_the_trend_filter_and_the_daily_limit():
     assert ls.step(state, s, 8, DAY, True, 1.5, 15, 3) is None
     state = {"date": DAY.isoformat(), "bias": "short", "seen": None, "open": None, "trades": []}
     assert ls.step(state, s, 8, DAY, False, 1.5, 15, 3)[0] == "SIGNAL"
-    full = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{}, {}, {}]}
+    full = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{"r": 1.5}] * 3}
     assert ls.step(full, s, 8, DAY, True, 1.5, 15, 3)[0] == "END"
+    stopped = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None,
+               "trades": [{"r": -1.0}, {"r": 1.5}, {"r": -1.0}, {"r": -1.0}]}
+    kind, line = ls.step(stopped, s, 8, DAY, True, 1.5, 15, 6)
+    assert kind == "END" and line.startswith("3 Verluste heute: Pause")
+    two = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{"r": -1.0}] * 2}
+    assert ls.step(two, s, 8, DAY, True, 1.5, 15, 6)[0] == "SIGNAL"
     late = {"date": DAY.isoformat(), "bias": "long", "seen": 66, "open": None, "trades": []}
     assert ls.step(late, s, 67, DAY, True, 1.5, 15, 3)[0] == "END"
 

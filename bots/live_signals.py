@@ -6,7 +6,7 @@ printing one line and keeping the day in trader/state/live_signals.json:
 
   SIGNAL   a complete bar gave a BUY or SELL: entry, stop, target, reward:risk
   CLOSED   the open signal reached its stop or target, or the 15:55 flat-by
-  END      no more entries today (after 21:00 German time, max trades, closed day)
+  END      no more entries today (after 21:05 German time, max trades, 3 losses, closed day)
   WAIT     --max-minutes ran out with nothing new: just run it again
 
 Exit code 0 for SIGNAL, CLOSED and END, 3 for WAIT. A bar only counts once
@@ -91,7 +91,8 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades, history=None):
+def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades, history=None,
+         max_losses=3):
     """Advance the day by the bars up to slot `complete`. Returns (event, line) or None.
 
     history holds earlier sessions for the 15/45-minute and volume context.
@@ -106,6 +107,10 @@ def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades, 
             state["seen"] = max(state["seen"] or -1, slot)
             return "CLOSED", closed_line(day, sig, result, r, slot)
         return None
+    losses = sum(1 for t in state["trades"] if t["r"] < 0)
+    if losses >= max_losses:
+        return "END", (f"{losses} Verluste heute: Pause bis morgen, keine weiteren Signale. "
+                       "Nach mehreren Verlusten nachzulegen ist der teuerste Fehler im Day-Trading.")
     if len(state["trades"]) >= max_trades:
         return "END", f"{max_trades} Signale heute erreicht. Für heute keine weiteren."
     if complete > vs.LAST_ENTRY_SLOT:
@@ -157,7 +162,7 @@ def cmd_next(args):
         complete = complete_slot(session, data_time, now)
         if complete >= 0:
             event = step(state, session, complete, day, args.trend_filter, args.rr, args.min_risk,
-                         args.max_trades, history)
+                         args.max_trades, history, args.max_losses)
             save_state(state)
             if event:
                 print(f"{event[0]} {event[1]}")
@@ -185,7 +190,8 @@ def main(argv=None):
                    help="signal both sides whatever the daily trend")
     p.add_argument("--rr", type=float, default=1.5, help="target in R (default 1.5)")
     p.add_argument("--min-risk", type=float, default=15.0, help="skip stops under this many points")
-    p.add_argument("--max-trades", type=int, default=3, help="signals a day (default 3)")
+    p.add_argument("--max-trades", type=int, default=6, help="signals a day (default 6)")
+    p.add_argument("--max-losses", type=int, default=3, help="pause for the day after this many losses")
     p.add_argument("--max-minutes", type=float, default=100, help="return WAIT after this long")
     args = p.parse_args(argv)
     return {"next": cmd_next, "status": cmd_status}[args.command](args)
