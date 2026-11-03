@@ -46,9 +46,23 @@ def test_opening_range_needs_every_bar():
 
 def test_trigger_is_first_close_above_not_a_wick():
     bars = orb.parse_bars(ROWS)
-    bar = orb.find_trigger(bars, DAY, 15, 112)
-    assert bar["close"] == 114
-    assert orb.find_trigger(bars, DAY, 15, 200) is None
+    bar, direction = orb.find_trigger(bars, DAY, 15, 112, 95, {"BUY"})
+    assert (bar["close"], direction) == (114, "BUY")
+    assert orb.find_trigger(bars, DAY, 15, 200, 95, {"BUY"}) == (None, None)
+
+
+def test_trigger_short_below_the_low_and_only_when_allowed():
+    rows = ROWS[:3] + [row("2026-11-03T14:45:00", 100, 101, 90, 93)]
+    bars = orb.parse_bars(rows)
+    bar, direction = orb.find_trigger(bars, DAY, 15, 112, 95, {"BUY", "SELL"})
+    assert (bar["close"], direction) == (93, "SELL")
+    assert orb.find_trigger(bars, DAY, 15, 112, 95, {"BUY"}) == (None, None)
+
+
+def test_trigger_buffer_needs_a_clear_close():
+    bars = orb.parse_bars(ROWS)
+    bar, _ = orb.find_trigger(bars, DAY, 15, 112, 95, {"BUY", "SELL"}, buffer=3)
+    assert bar["close"] == 119
 
 
 def test_closed_bars_drops_the_forming_bar():
@@ -57,19 +71,63 @@ def test_closed_bars_drops_the_forming_bar():
     assert len(orb.closed_bars(bars, now, 5)) == 5
 
 
-def test_plan_trade_sizes_to_the_max_loss():
-    plan = orb.plan_trade(ask=114.0, or_high=112, or_low=95, stop_mode="mid", rr=2, risk=50,
-                          point_value=1, min_size=0.1, step=0.1, decimals=1)
-    assert plan["stop"] == 103.5
-    assert plan["target"] == 135.0
-    assert plan["size"] == 4.7
+def test_plan_trade_sizes_a_long_to_the_max_loss():
+    plan = orb.plan_trade("BUY", 114.0, 112, 95, "mid", 2, 50, 1, 0.1, 0.1, 1)
+    assert (plan["stop"], plan["target"], plan["size"]) == (103.5, 135.0, 4.7)
     assert plan["max_loss"] <= 50
+
+
+def test_plan_trade_mirrors_a_short():
+    plan = orb.plan_trade("SELL", 93.0, 112, 95, "mid", 2, 50, 1, 0.1, 0.1, 1)
+    assert (plan["stop"], plan["target"], plan["size"]) == (103.5, 72.0, 4.7)
+    edge = orb.plan_trade("SELL", 93.0, 112, 95, "edge", 2, 50, 1, 0.1, 0.1, 1)
+    assert edge["stop"] == 112
 
 
 def test_plan_trade_refuses_a_stop_too_far_for_the_risk():
     with pytest.raises(orb.BotError, match="Kein Trade"):
-        orb.plan_trade(ask=114.0, or_high=112, or_low=95, stop_mode="low", rr=2, risk=5,
-                       point_value=1, min_size=1, step=1, decimals=1)
+        orb.plan_trade("BUY", 114.0, 112, 95, "edge", 2, 5, 1, 1, 1, 1)
+
+
+def daily(closes, spread):
+    """Daily bars from closes, each with the given high-low range."""
+    start = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+    return [{"start": start + datetime.timedelta(days=i), "open": c, "high": c + r / 2,
+             "low": c - r / 2, "close": c} for i, (c, r) in enumerate(zip(closes, spread))]
+
+
+def test_regime_reads_trend_and_stress():
+    up = orb.market_regime(daily(range(100, 130), [10] * 30))
+    assert (up["bias"], up["stress"]) == ("long", "normal")
+    down = orb.market_regime(daily(range(130, 100, -1), [10] * 25 + [20] * 5))
+    assert down["bias"] == "short" and down["stress"] == "erhöht"
+    calm_then_wild = orb.market_regime(daily([100] * 30, [10] * 25 + [40] * 5))
+    assert calm_then_wild["bias"] == "neutral" and calm_then_wild["stress"] == "hoch"
+    with pytest.raises(orb.BotError, match="Zu wenig"):
+        orb.market_regime(daily([100] * 10, [10] * 10))
+
+
+def test_sides_follow_the_bias_unless_overridden():
+    assert orb.allowed_sides("auto", "long") == ({"BUY"}, False)
+    assert orb.allowed_sides("auto", "short") == ({"SELL"}, False)
+    assert orb.allowed_sides("auto", "neutral") == ({"BUY", "SELL"}, True)
+    assert orb.allowed_sides("short", "long") == ({"SELL"}, False)
+
+
+def test_stress_scales_the_risk():
+    assert orb.risk_for({"stress": "normal"}, 50) == 50
+    assert orb.risk_for({"stress": "erhöht"}, 50) == 25
+    assert orb.risk_for({"stress": "hoch"}, 50) == 0
+
+
+def test_range_and_target_filters():
+    regime = {"atr": 40.0}
+    assert orb.range_problem((112, 95), regime, 0.5) is None
+    assert "zu unruhig" in orb.range_problem((130, 95), regime, 0.5).lower()
+    near = {"entry": 114.0, "target": 135.0}
+    far = {"entry": 114.0, "target": 160.0}
+    assert orb.target_problem(near, regime, 1.0) is None
+    assert "Unrealistisch" in orb.target_problem(far, regime, 1.0)
 
 
 def test_session_times_on_a_normal_day_a_holiday_and_an_early_close():
@@ -108,7 +166,7 @@ def test_client_logs_in_and_places_a_bracket_order(monkeypatch):
 
     api = orb.Capital(orb.DEMO_URL, "key", "me@example.com", "pw", opener=opener)
     api.login()
-    assert api.buy("US100", 4.7, 103.5, 135.0) == ("d_1", 114.2)
+    assert api.order("US100", "BUY", 4.7, 103.5, 135.0) == ("d_1", 114.2)
     method, url, headers, data = sent[1]
     assert (method, url) == ("POST", orb.DEMO_URL + "/api/v1/positions")
     assert headers["Cst"] == "c" and headers["X-security-token"] == "x"
@@ -126,7 +184,7 @@ def test_client_raises_on_a_rejected_order(monkeypatch):
 
     api = orb.Capital(orb.DEMO_URL, "key", "me@example.com", "pw", opener=opener)
     with pytest.raises(orb.BotError, match="RISK_CHECK"):
-        api.buy("US100", 1, 100, 120)
+        api.order("US100", "SELL", 1, 120, 100)
 
 
 def test_live_needs_the_extra_environment_variable(monkeypatch, capsys):
@@ -135,3 +193,76 @@ def test_live_needs_the_extra_environment_variable(monkeypatch, capsys):
     monkeypatch.delenv("CAPITAL_LIVE", raising=False)
     assert orb.main(["run", "--live"]) == 2
     assert "CAPITAL_LIVE=yes" in capsys.readouterr().err
+
+
+class Clock:
+    """A fake clock: time.sleep moves it forward, datetime.now reads it."""
+
+    def __init__(self, start):
+        self.now = start
+        clock = self
+
+        class FakeDatetime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.now.astimezone(tz) if tz else clock.now.replace(tzinfo=None)
+
+        self.datetime = FakeDatetime
+
+    def sleep(self, seconds):
+        self.now += datetime.timedelta(seconds=seconds)
+
+
+class FakeBroker:
+    """Serves daily and 5-minute bars up to the clock, takes orders, hits the stop at 16:30 UTC."""
+
+    base = orb.DEMO_URL
+
+    def __init__(self, clock, daily_bars, intraday):
+        self.clock, self.daily, self.intraday = clock, daily_bars, intraday
+        self.orders, self.open = [], set()
+
+    def bars(self, epic, minutes, count=200):
+        if minutes == 1440:
+            return self.daily
+        return [b for b in orb.parse_bars(self.intraday) if b["start"] <= self.clock.now]
+
+    def market(self, epic):
+        return {"snapshot": {"marketStatus": "TRADEABLE", "bid": 92.5, "offer": 93.5,
+                             "decimalPlacesFactor": 1},
+                "dealingRules": {"minDealSize": {"value": 0.1}, "minSizeIncrement": {"value": 0.1}},
+                "instrument": {"currency": "USD"}}
+
+    def order(self, epic, direction, size, stop, target):
+        self.orders.append((direction, size, stop, target))
+        self.open.add("d_1")
+        return "d_1", 92.5
+
+    def positions(self):
+        if self.clock.now >= datetime.datetime(2026, 11, 3, 16, 30, tzinfo=datetime.timezone.utc):
+            self.open.clear()
+        return [{"position": {"dealId": d}, "market": {"epic": "US100"}} for d in self.open]
+
+
+def test_a_full_day_goes_short_in_a_downtrend(monkeypatch, tmp_path):
+    clock = Clock(datetime.datetime(2026, 11, 3, 14, 35, tzinfo=datetime.timezone.utc))
+    monkeypatch.setattr(orb.datetime, "datetime", clock.datetime)
+    monkeypatch.setattr(orb.time, "sleep", clock.sleep)
+    monkeypatch.setattr(orb, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(orb, "KILL_SWITCH", tmp_path / "STOP")
+    downtrend = daily(range(160, 120, -1), [40] * 40)
+    intraday = ROWS[:3] + [
+        row("2026-11-03T14:45:00", 101, 112, 96, 108),   # inside the range
+        row("2026-11-03T14:50:00", 108, 111, 90, 93),    # closes below the low 95
+        row("2026-11-03T14:55:00", 93, 95, 85, 88),
+    ]
+    broker = FakeBroker(clock, downtrend, intraday)
+    parser_args = ["run", "--max-or-atr", "1", "--max-target-atr", "2"]
+    monkeypatch.setattr(orb, "Capital", lambda *a: broker)
+    broker.login = lambda: None
+    for name in ("CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_API_PASSWORD"):
+        monkeypatch.setenv(name, "x")
+    assert orb.main(parser_args) == 0
+    assert broker.orders == [("SELL", 4.5, 103.5, 70.5)]
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["trades"][0]["direction"] == "SELL" and state["trades"][0]["open"] is False

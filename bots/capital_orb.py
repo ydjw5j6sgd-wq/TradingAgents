@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""Opening-range breakout bot for Capital.com CFDs (default: US100, the Nasdaq 100).
+"""Market-aware opening-range breakout bot for Capital.com CFDs (default: US100, the Nasdaq 100).
 
-Runs one trading day on its own: builds the 9:30-9:45 New York opening range
-from Capital.com's own 5-minute bars, buys on the first CLOSED bar above the
-range high, sends the stop and the target with the order, and closes the
-position at the flat-by time if neither was hit. Long only, one trade a day.
+Runs one trading day on its own, long or short:
 
-Demo account by default. The live account needs both --live and the
-environment variable CAPITAL_LIVE=yes. --dry-run logs every decision and
-sends no order at all.
+1. Reads the market first, from Capital.com's daily bars: the trend (last
+   close against a rising or falling 20-day average) sets the bias, and
+   stress (the 5-day against the 20-day average true range) sets the risk:
+   normal is full size, raised is half size, high is no trade today.
+2. Builds the 9:30-9:45 New York opening range from 5-minute bars and skips
+   the day when the range is too wide for the daily ATR.
+3. Trades the first CLOSED bar beyond the range in a direction the bias
+   allows: above the high is a buy, below the low is a sell. A neutral bias
+   allows both, but the close has to clear the range by a buffer.
+4. Sends the stop and the target with the order, skips a target too far for
+   the day's ATR, and closes the position at the flat-by time.
+
+One trade a day. Demo account by default; the live account needs both --live
+and CAPITAL_LIVE=yes. --dry-run logs every decision and sends no order.
 
 Credentials come from environment variables only, never from arguments:
   CAPITAL_API_KEY       the API key (Capital.com: Settings > API integrations)
   CAPITAL_IDENTIFIER    the login email of the account
   CAPITAL_API_PASSWORD  the custom password set for that API key
 
+  python3 bots/capital_orb.py regime              # market read and today's range, no trading
   python3 bots/capital_orb.py run --dry-run       # watch and log, no orders
   python3 bots/capital_orb.py run                 # trade on the demo account
   python3 bots/capital_orb.py status              # account, positions, today's state
@@ -46,9 +55,11 @@ BERLIN = ZoneInfo("Europe/Berlin")
 
 DEMO_URL = "https://demo-api-capital.backend-capital.com"
 LIVE_URL = "https://api-capital.backend-capital.com"
-RESOLUTIONS = {5: "MINUTE_5", 1: "MINUTE"}
+RESOLUTIONS = {5: "MINUTE_5", 1: "MINUTE", 1440: "DAY"}
 
 OPEN = datetime.time(9, 30)
+SIDES = {"long": {"BUY"}, "short": {"SELL"}, "both": {"BUY", "SELL"}}
+WORDS = {"BUY": "KAUF (long)", "SELL": "VERKAUF (short)"}
 
 
 def _load_calendar():
@@ -102,6 +113,43 @@ def closed_bars(bars, now, minutes):
     return [b for b in bars if b["start"] + datetime.timedelta(minutes=minutes) <= now]
 
 
+def market_regime(daily, stress_raised=1.5, stress_high=2.0):
+    """Trend bias and stress from closed daily bars (oldest first).
+
+    Bias: long when the last close is above a rising 20-day average, short
+    when it is below a falling one, neutral otherwise. Stress: the 5-day
+    average true range against the 20-day one.
+    """
+    if len(daily) < 26:
+        raise BotError(f"Zu wenig Tageskerzen für die Marktlage ({len(daily)}, gebraucht 26)")
+    avg = lambda xs: sum(xs) / len(xs)
+    closes = [b["close"] for b in daily]
+    sma20, sma20_before = avg(closes[-20:]), avg(closes[-25:-5])
+    ranges = [max(b["high"] - b["low"], abs(b["high"] - prev["close"]), abs(b["low"] - prev["close"]))
+              for prev, b in zip(daily, daily[1:])]
+    atr20, atr5 = avg(ranges[-20:]), avg(ranges[-5:])
+    last = closes[-1]
+    if last > sma20 and sma20 > sma20_before:
+        bias = "long"
+    elif last < sma20 and sma20 < sma20_before:
+        bias = "short"
+    else:
+        bias = "neutral"
+    ratio = atr5 / atr20
+    stress = "hoch" if ratio >= stress_high else "erhöht" if ratio >= stress_raised else "normal"
+    return {"bias": bias, "stress": stress, "stress_ratio": round(ratio, 2), "atr": atr20,
+            "sma20": sma20, "prev_close": last}
+
+
+def allowed_sides(side, bias):
+    """The directions to trade and whether a breakout needs the extra buffer."""
+    if side != "auto":
+        return SIDES[side], False
+    if bias == "neutral":
+        return SIDES["both"], True
+    return SIDES[bias], False
+
+
 def opening_range(bars, day, or_minutes, minutes):
     """(high, low) of the bars from 9:30 New York, or None until all of them are in."""
     start = datetime.datetime.combine(day, OPEN, tzinfo=NY)
@@ -112,31 +160,66 @@ def opening_range(bars, day, or_minutes, minutes):
     return max(b["high"] for b in inside), min(b["low"] for b in inside)
 
 
-def find_trigger(bars, day, or_minutes, level):
-    """The first bar after the range whose close is above the level, or None."""
+def find_trigger(bars, day, or_minutes, high, low, sides, buffer=0.0):
+    """(bar, "BUY" | "SELL") for the first close beyond the range, or (None, None)."""
     end = datetime.datetime.combine(day, OPEN, tzinfo=NY) + datetime.timedelta(minutes=or_minutes)
     for b in bars:
-        if b["start"] >= end and b["close"] > level:
-            return b
-    return None
+        if b["start"] < end:
+            continue
+        if "BUY" in sides and b["close"] > high + buffer:
+            return b, "BUY"
+        if "SELL" in sides and b["close"] < low - buffer:
+            return b, "SELL"
+    return None, None
 
 
-def plan_trade(ask, or_high, or_low, stop_mode, rr, risk, point_value, min_size, step, decimals):
-    """Stop, target and size for a long at the ask. Raises BotError when it does not fit."""
-    stop = (or_high + or_low) / 2 if stop_mode == "mid" else or_low
+def plan_trade(direction, price, or_high, or_low, stop_mode, rr, risk, point_value,
+               min_size, step, decimals):
+    """Stop, target and size for a trade at price. Raises BotError when it does not fit.
+
+    The stop sits at the range midpoint or at the far edge of the range (the
+    low for a buy, the high for a sell), rounded away from the price.
+    """
     factor = 10 ** decimals
-    stop = math.floor(stop * factor) / factor
-    if stop >= ask:
-        raise BotError(f"Stop {stop} liegt nicht unter dem Einstieg {ask}")
-    dist = ask - stop
-    target = math.ceil((ask + rr * dist) * factor) / factor
+    long = direction == "BUY"
+    edge = or_low if long else or_high
+    stop = (or_high + or_low) / 2 if stop_mode == "mid" else edge
+    stop = math.floor(stop * factor) / factor if long else math.ceil(stop * factor) / factor
+    dist = price - stop if long else stop - price
+    if dist <= 0:
+        raise BotError(f"Stop {stop} liegt auf der falschen Seite des Einstiegs {price}")
+    target = price + rr * dist if long else price - rr * dist
+    target = math.ceil(target * factor) / factor if long else math.floor(target * factor) / factor
     raw = risk / (dist * point_value)
     size = round(math.floor(raw / step + 1e-9) * step, 6)
     if size < min_size:
         raise BotError(f"Stop zu weit weg: {dist:.2f} Punkte bei max. Verlust {risk} ergibt "
                        f"Größe {raw:.4f}, das Minimum ist {min_size}. Kein Trade.")
-    return {"entry": ask, "stop": stop, "target": target, "size": size,
+    return {"direction": direction, "entry": price, "stop": stop, "target": target, "size": size,
             "max_loss": round(size * dist * point_value, 2)}
+
+
+def range_problem(rng, regime, max_or_atr):
+    """Why the opening range is not worth trading today, or None."""
+    width = rng[0] - rng[1]
+    if width > max_or_atr * regime["atr"]:
+        return (f"Opening Range {width:.1f} Punkte breit, mehr als {max_or_atr:g} x ATR "
+                f"({regime['atr']:.1f}). Zu unruhig, heute kein Trade.")
+    return None
+
+
+def target_problem(plan, regime, max_target_atr):
+    """Why the target is out of reach for a normal day, or None."""
+    reach = abs(plan["target"] - plan["entry"])
+    if reach > max_target_atr * regime["atr"]:
+        return (f"Ziel {reach:.1f} Punkte entfernt, mehr als {max_target_atr:g} x ATR "
+                f"({regime['atr']:.1f}). Unrealistisch, kein Trade.")
+    return None
+
+
+def risk_for(regime, risk):
+    """Full risk on a normal day, half when stress is raised, none when it is high."""
+    return {"normal": risk, "erhöht": risk / 2, "hoch": 0.0}[regime["stress"]]
 
 
 # ---------------------------------------------------------------- API client
@@ -174,9 +257,9 @@ class Capital:
     def market(self, epic):
         return self._call("GET", f"/api/v1/markets/{epic}")
 
-    def bars(self, epic, minutes):
+    def bars(self, epic, minutes, count=200):
         return parse_bars(self._call(
-            "GET", f"/api/v1/prices/{epic}?resolution={RESOLUTIONS[minutes]}&max=200")["prices"])
+            "GET", f"/api/v1/prices/{epic}?resolution={RESOLUTIONS[minutes]}&max={count}")["prices"])
 
     def positions(self):
         return self._call("GET", "/api/v1/positions").get("positions", [])
@@ -184,9 +267,9 @@ class Capital:
     def accounts(self):
         return self._call("GET", "/api/v1/accounts").get("accounts", [])
 
-    def buy(self, epic, size, stop, target):
+    def order(self, epic, direction, size, stop, target):
         ref = self._call("POST", "/api/v1/positions", {
-            "epic": epic, "direction": "BUY", "size": size, "guaranteedStop": False,
+            "epic": epic, "direction": direction, "size": size, "guaranteedStop": False,
             "stopLevel": stop, "profitLevel": target})["dealReference"]
         time.sleep(1)
         confirm = self._call("GET", f"/api/v1/confirms/{ref}")
@@ -232,7 +315,8 @@ def dealing_rules(market):
     snap = market.get("snapshot", {})
     return {"min_size": value("minDealSize", 0.01), "step": value("minSizeIncrement", 0.01),
             "decimals": snap.get("decimalPlacesFactor", 2), "ask": snap.get("offer"),
-            "status": snap.get("marketStatus"), "currency": market.get("instrument", {}).get("currency")}
+            "bid": snap.get("bid"), "status": snap.get("marketStatus"),
+            "currency": market.get("instrument", {}).get("currency")}
 
 
 def open_deal_ids(api, epic):
@@ -247,6 +331,36 @@ def sleep_until(t):
         time.sleep(min(left, 60))
 
 
+def read_market(api, args, now):
+    daily = closed_bars(api.bars(args.epic, 1440, 60), now, 1440)
+    regime = market_regime(daily, args.stress_raised, args.stress_high)
+    sides, buffered = allowed_sides(args.side, regime["bias"])
+    log(f"Marktlage {args.epic}: Trend {regime['bias']}, Stress {regime['stress']} "
+        f"(ATR 5/20 = {regime['stress_ratio']}), ATR {regime['atr']:.1f}, "
+        f"Vortagesschluss {regime['prev_close']:.1f}. "
+        f"Erlaubt: {', '.join(WORDS[s] for s in sorted(sides))}"
+        f"{' mit Puffer' if buffered else ''}.")
+    return regime, sides, buffered
+
+
+def regime_cmd(api, args):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    day = now.astimezone(NY).date()
+    regime, _, _ = read_market(api, args, now)
+    risk = risk_for(regime, args.risk)
+    log(f"Risiko heute: {risk:g} pro Trade" + (" (kein Trade bei hohem Stress)" if not risk else ""))
+    rng = opening_range(closed_bars(api.bars(args.epic, args.interval), now, args.interval),
+                        day, args.or_minutes, args.interval)
+    if rng:
+        log(f"Opening Range: Hoch {rng[0]:.2f}, Tief {rng[1]:.2f}.")
+        problem = range_problem(rng, regime, args.max_or_atr)
+        if problem:
+            log(problem)
+    else:
+        log("Opening Range noch nicht vollständig.")
+    return 0
+
+
 def run(api, args):
     now = datetime.datetime.now(datetime.timezone.utc)
     day = now.astimezone(NY).date()
@@ -259,16 +373,27 @@ def run(api, args):
     state = load_state(day)
     mode = "DRY-RUN" if args.dry_run else ("LIVE" if api.base == LIVE_URL else "DEMO")
     log(f"{mode} {args.epic}: Range bis {de(or_end)}, Einstiege bis {de(cutoff)}, "
-        f"glattstellen um {de(flat_by)}, max. Verlust {args.risk} pro Trade.")
+        f"glattstellen um {de(flat_by)}, max. Verlust {args.risk:g} pro Trade.")
 
     deal = next((t for t in state["trades"] if t.get("open")), None)
-    if deal is None and len(state["trades"]) >= args.max_trades:
+    if deal is not None:
+        log(f"Offene Position aus diesem Tag gefunden (Deal {deal['deal_id']}), wird weiter verwaltet.")
+        return manage(api, args, deal, state, flat_by)
+    if len(state["trades"]) >= args.max_trades:
         log("Heute schon gehandelt. Keine weiteren Einstiege.")
         return 0
 
+    regime, sides, buffered = read_market(api, args, now)
+    risk = risk_for(regime, args.risk)
+    if not risk:
+        log("Stress hoch: Die Schwankungen sind doppelt so groß wie üblich. Heute kein Trade.")
+        return 0
+    if risk < args.risk:
+        log(f"Stress erhöht: Risiko auf {risk:g} pro Trade halbiert.")
+
     sleep_until(or_end + datetime.timedelta(seconds=20))
     rng = None
-    while deal is None:
+    while True:
         now = datetime.datetime.now(datetime.timezone.utc)
         if now >= cutoff:
             log("Einstiegsfenster vorbei, kein Ausbruch. Heute kein Trade.")
@@ -282,31 +407,35 @@ def run(api, args):
                     return 1
             else:
                 log(f"Opening Range: Hoch {rng[0]:.2f}, Tief {rng[1]:.2f}.")
+                problem = range_problem(rng, regime, args.max_or_atr)
+                if problem:
+                    log(problem)
+                    return 0
         if rng:
-            bar = find_trigger(bars, day, args.or_minutes, rng[0])
+            buffer = args.buffer * (rng[0] - rng[1]) if buffered else 0.0
+            bar, direction = find_trigger(bars, day, args.or_minutes, rng[0], rng[1], sides, buffer)
             if bar:
                 bar_end = bar["start"] + datetime.timedelta(minutes=args.interval)
                 if now - bar_end > datetime.timedelta(minutes=args.interval + 2):
-                    log(f"Ausbruch schon um {de(bar_end)} – zu alt für einen Einstieg. Kein Trade.")
+                    log(f"Ausbruch schon um {de(bar_end)}, zu alt für einen Einstieg. Kein Trade.")
                     return 0
-                log(f"AUSBRUCH: Kerze bis {de(bar_end)} schloss bei {bar['close']:.2f} "
-                    f"über dem Hoch {rng[0]:.2f}.")
-                deal = enter(api, args, rng, state)
+                side = "über dem Hoch" if direction == "BUY" else "unter dem Tief"
+                log(f"AUSBRUCH {WORDS[direction]}: Kerze bis {de(bar_end)} schloss bei "
+                    f"{bar['close']:.2f} {side}.")
+                deal = enter(api, args, direction, rng, regime, risk, state)
                 if deal is None:
                     return 0
-                break
-            elif bars:
-                last = bars[-1]
-                log(f"Wartet: letzter Schluss {last['close']:.2f}, "
-                    f"{rng[0] - last['close']:.2f} Punkte unter dem Hoch.")
+                return manage(api, args, deal, state, flat_by)
+            if bars:
+                last = bars[-1]["close"]
+                log(f"Wartet: letzter Schluss {last:.2f} (Range {rng[1]:.2f} - {rng[0]:.2f}"
+                    f"{f', Puffer {buffer:.1f}' if buffer else ''}).")
         step = args.interval * 60
         wake = (int(now.timestamp()) // step + 1) * step + 15
         sleep_until(datetime.datetime.fromtimestamp(wake, datetime.timezone.utc))
 
-    return manage(api, args, deal, state, flat_by)
 
-
-def enter(api, args, rng, state):
+def enter(api, args, direction, rng, regime, risk, state):
     if KILL_SWITCH.exists():
         log(f"Kill-Switch {KILL_SWITCH} ist da. Kein Einstieg.")
         return None
@@ -314,25 +443,30 @@ def enter(api, args, rng, state):
     if rules["status"] != "TRADEABLE":
         log(f"Markt nicht handelbar ({rules['status']}). Kein Einstieg.")
         return None
+    price = rules["ask"] if direction == "BUY" else rules["bid"]
     try:
-        plan = plan_trade(rules["ask"], rng[0], rng[1], args.stop, args.rr, args.risk,
+        plan = plan_trade(direction, price, rng[0], rng[1], args.stop, args.rr, risk,
                           args.point_value, rules["min_size"], rules["step"], rules["decimals"])
     except BotError as e:
         log(str(e))
         return None
-    log(f"Plan: Kauf {plan['size']} @ ~{plan['entry']}, Stop {plan['stop']}, Ziel {plan['target']}, "
-        f"max. Verlust ~{plan['max_loss']} {rules['currency'] or ''}.")
+    problem = target_problem(plan, regime, args.max_target_atr)
+    if problem:
+        log(problem)
+        return None
+    log(f"Plan: {WORDS[direction]} {plan['size']} @ ~{plan['entry']}, Stop {plan['stop']}, "
+        f"Ziel {plan['target']}, max. Verlust ~{plan['max_loss']} {rules['currency'] or ''}.")
     if args.dry_run:
         log("DRY-RUN: keine Order gesendet.")
         state["trades"].append({**plan, "dry_run": True})
         save_state(state)
         return None
-    deal_id, level = api.buy(args.epic, plan["size"], plan["stop"], plan["target"])
+    deal_id, level = api.order(args.epic, direction, plan["size"], plan["stop"], plan["target"])
     trade = {**plan, "deal_id": deal_id, "fill": level, "open": True,
              "time": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     state["trades"].append(trade)
     save_state(state)
-    log(f"GEKAUFT: Deal {deal_id}, Kurs {level}.")
+    log(f"AUSGEFÜHRT: {WORDS[direction]}, Deal {deal_id}, Kurs {level}.")
     return trade
 
 
@@ -384,15 +518,28 @@ def hhmm(s):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("command", choices=["run", "status", "flatten"])
+    p.add_argument("command", choices=["run", "regime", "status", "flatten"])
     p.add_argument("--epic", default="US100", help="Capital.com market (default US100)")
+    p.add_argument("--side", choices=["auto", "long", "short", "both"], default="auto",
+                   help="auto follows the trend bias (default); the others override it")
     p.add_argument("--risk", type=float, default=50.0,
                    help="max loss per trade in the instrument's currency (default 50)")
     p.add_argument("--point-value", type=float, default=1.0,
                    help="profit or loss per point for size 1 (default 1)")
-    p.add_argument("--stop", choices=["mid", "low"], default="mid",
-                   help="stop at the range midpoint or the range low (default mid)")
+    p.add_argument("--stop", choices=["mid", "edge"], default="mid",
+                   help="stop at the range midpoint or its far edge (default mid)")
     p.add_argument("--rr", type=float, default=2.0, help="target in R (default 2)")
+    p.add_argument("--buffer", type=float, default=0.1,
+                   help="with a neutral bias, the close must clear the range by this share "
+                        "of its width (default 0.1)")
+    p.add_argument("--max-or-atr", type=float, default=0.5,
+                   help="skip the day when the range is wider than this times the ATR (default 0.5)")
+    p.add_argument("--max-target-atr", type=float, default=1.0,
+                   help="skip a target farther than this times the ATR (default 1.0)")
+    p.add_argument("--stress-raised", type=float, default=1.5,
+                   help="ATR 5/20 ratio that halves the risk (default 1.5)")
+    p.add_argument("--stress-high", type=float, default=2.0,
+                   help="ATR 5/20 ratio that stops trading for the day (default 2.0)")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--interval", type=int, choices=[1, 5], default=5)
     p.add_argument("--no-entries-after", type=hhmm, default=hhmm("15:30"), help="New York time")
@@ -416,9 +563,10 @@ def main(argv=None):
 
     api = Capital(LIVE_URL if args.live else DEMO_URL, os.environ["CAPITAL_API_KEY"],
                   os.environ["CAPITAL_IDENTIFIER"], os.environ["CAPITAL_API_PASSWORD"])
+    commands = {"run": run, "regime": regime_cmd, "status": status, "flatten": flatten}
     try:
         api.login()
-        return {"run": run, "status": status, "flatten": flatten}[args.command](api, args)
+        return commands[args.command](api, args)
     except BotError as e:
         log(f"FEHLER: {e}")
         return 1
