@@ -18,20 +18,26 @@ long oder short, je nach Marktlage. Standardmäßig handelt er den Nasdaq-100-CF
 2. **Opening Range** von 15:30 bis 15:45 Uhr deutscher Zeit (9:30 bis 9:45 Uhr New York).
    Ist sie breiter als die Hälfte der normalen Tagesschwankung (ATR), ist der Markt zu unruhig,
    und der Bot handelt heute nicht.
-3. **Signal:** Die erste **geschlossene** Kerze außerhalb der Range löst den Trade aus.
-   Ein Docht reicht nicht.
-   - Bei Marktlage long nur **Kauf**, wenn eine Kerze über dem Hoch schließt.
-   - Bei Marktlage short nur **Verkauf**, wenn eine Kerze unter dem Tief schließt.
-   - Bei Marktlage neutral sind **beide Richtungen** erlaubt, aber der Schluss muss um
-     10 % der Range-Breite jenseits der Grenze liegen.
-4. **Chance prüfen:** Der Stop liegt auf der Mitte der Range, das Ziel bei 2R.
-   Liegt das Ziel weiter als eine normale Tagesschwankung entfernt,
-   lässt der Bot den Trade aus.
+3. **Signal:** Die erste **vollständige** Kerze, die **klar** außerhalb der Range schließt,
+   löst den Trade aus. Ein Docht reicht nicht.
+   - **Klar** heißt: mindestens 5 % der Range-Breite jenseits der Grenze. Ein Schluss
+     1 Punkt über dem Hoch zählt nicht.
+   - **Vollständig** heißt: Capital.com hat schon die nächste Kerze begonnen. So kann
+     eine halb fertige Kerze kein Fehlsignal auslösen.
+   - Bei Marktlage long nur **Kauf** über dem Hoch, bei Marktlage short nur **Verkauf**
+     unter dem Tief, bei Marktlage neutral beide Richtungen.
+   - Einstiege nur bis **17:30 Uhr** deutscher Zeit (11:30 Uhr New York). Danach pendelt
+     der Markt oft nur noch hin und her.
+4. **Chance prüfen:** Der Stop liegt auf der Mitte der Range. Das Ziel ist die Range-Höhe,
+   abgetragen ab der gebrochenen Grenze. Liegt das Chance-Risiko-Verhältnis zum
+   tatsächlichen Kurs unter **1,5 : 1**, war der Ausbruch schon zu weit gelaufen, und der
+   Bot läuft nicht hinterher. Liegt das Ziel weiter als eine normale Tagesschwankung
+   entfernt, lässt er den Trade ebenfalls aus.
 5. **Order:** Stop und Ziel gehen mit der Order an den Broker. Die Größe ergibt sich
    aus dem maximalen Verlust pro Trade.
 6. Um 21:55 Uhr deutscher Zeit wird **glattgestellt**, wenn bis dahin weder Stop noch Ziel erreicht wurde.
 
-Der Bot handelt höchstens einmal am Tag und eröffnet nach 21:30 Uhr keine neuen Positionen.
+Der Bot handelt höchstens einmal am Tag.
 An Wochenenden und US-Feiertagen handelt er nicht, an verkürzten Handelstagen
 verschiebt er die Zeiten nach vorn.
 
@@ -80,6 +86,21 @@ ANTHROPIC_API_KEY=...
 
 Die Modellnamen kannst du anpassen. Die Hauptanleitung des Repos (`README.md`) listet die übrigen Anbieter.
 
+## Morgenanalyse (`morning_brief.py`)
+
+```bash
+python3 bots/morning_brief.py          # Analyse auf Deutsch
+python3 bots/morning_brief.py --json   # dieselben Zahlen als JSON
+```
+
+Die Analyse braucht keine Zugangsdaten, nur die kostenlosen Yahoo-Kurse. Sie zeigt:
+
+- **Marktphase:** Trend, Stress, Lage in der 20-Tage-Spanne
+- **Wichtige Marken:** Vortag, 5-Tage-Spanne, ATR und die Eröffnung, auf die der Future über Nacht hindeutet
+- **Plan:** typische Range-Breite und das Chance-Risiko-Verhältnis in Punkten, das die Regeln erlauben
+- **Rückblick:** wie die Regeln des Bots auf den letzten rund 60 Handelstagen long und short abgeschnitten haben
+- **Empfehlung:** LONG, SHORT, BEIDE oder ABWARTEN
+
 ## Einrichtung
 
 1. **Den API-Schlüssel erstellst du bei Capital.com** unter Einstellungen > API-Integrationen.
@@ -110,7 +131,10 @@ Mit diesen Einstellungen passt du das Verhalten an:
 | `--side auto` | auto | `auto` folgt der Marktlage; `long`, `short` oder `both` erzwingen eine Richtung |
 | `--risk 50` | 50 | max. Verlust pro Trade, in der Währung des Instruments (beim US100 USD) |
 | `--stop mid` | mid | `mid` setzt den Stop auf die Mitte der Range, `edge` auf die gegenüberliegende Kante |
-| `--rr 2` | 2 | Ziel als Vielfaches des Risikos |
+| `--target measured` | measured | `measured`: Range-Höhe ab der Grenze; `r`: Vielfaches des Risikos (`--rr`) |
+| `--min-rr 1.5` | 1,5 | Mindest-Chance-Risiko-Verhältnis zum tatsächlichen Kurs |
+| `--buffer 0.05` | 0,05 | so weit (Anteil der Range-Breite) muss der Schluss jenseits der Grenze liegen |
+| `--no-entries-after 11:30` | 11:30 | letzter Einstieg, New-York-Zeit (17:30 Uhr deutscher Zeit) |
 | `--max-or-atr 0.5` | 0,5 | maximale Range-Breite im Verhältnis zur ATR |
 | `--max-target-atr 1` | 1,0 | maximale Entfernung zum Ziel im Verhältnis zur ATR |
 | `--stress-raised 1.5` / `--stress-high 2` | 1,5 / 2,0 | Schwellen für erhöhten und hohen Stress |

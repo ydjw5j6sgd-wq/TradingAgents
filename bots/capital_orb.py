@@ -9,11 +9,17 @@ Runs one trading day on its own, long or short:
    normal is full size, raised is half size, high is no trade today.
 2. Builds the 9:30-9:45 New York opening range from 5-minute bars and skips
    the day when the range is too wide for the daily ATR.
-3. Trades the first CLOSED bar beyond the range in a direction the bias
-   allows: above the high is a buy, below the low is a sell. A neutral bias
-   allows both, but the close has to clear the range by a buffer.
-4. Sends the stop and the target with the order, skips a target too far for
-   the day's ATR, and closes the position at the flat-by time.
+3. Trades the first COMPLETE bar that closes clearly beyond the range, by
+   at least a buffer (5% of the range width), in a direction the bias
+   allows: above the high is a buy, below the low is a sell. A bar is
+   complete once Capital.com has started the next one. A neutral bias
+   allows both directions. New entries only until 11:30 New York (17:30
+   in Germany).
+4. Aims at the measured move (the range height from the broken level) and
+   skips the trade when the reward:risk at the actual price is under 1.5,
+   so a late entry far beyond the level is not chased. Sends the stop and
+   the target with the order, skips a target too far for the day's ATR,
+   and closes the position at the flat-by time.
 
 With --agents it also needs today's call from bots/agent_desk.py (the
 TradingAgents team): it trades only the direction both the market read and
@@ -91,15 +97,16 @@ class BotError(Exception):
 def session_times(day, no_entries_after, flat_by):
     """(entry cutoff, flat-by) as New York times, or None on a closed day.
 
-    On a 1:00 p.m. early close both move up by the same gap they keep to
-    the regular 4:00 p.m. close.
+    On a 1:00 p.m. early close a time after 1:00 p.m. moves up by three
+    hours, keeping its gap to the close; an earlier one stays as it is.
     """
     if day.weekday() >= 5 or day.isoformat() in HOLIDAYS:
         return None
     if day.isoformat() not in EARLY_CLOSE:
         return no_entries_after, flat_by
+    early = datetime.time(13, 0)
     shift = datetime.timedelta(hours=3)
-    move = lambda t: (datetime.datetime.combine(day, t) - shift).time()
+    move = lambda t: (datetime.datetime.combine(day, t) - shift).time() if t > early else t
     return move(no_entries_after), move(flat_by)
 
 
@@ -117,6 +124,11 @@ def parse_bars(prices):
 
 def closed_bars(bars, now, minutes):
     return [b for b in bars if b["start"] + datetime.timedelta(minutes=minutes) <= now]
+
+
+def complete_bars(bars, now, minutes):
+    """Closed bars the broker has moved past: a later bar exists, so this one is final."""
+    return closed_bars(bars[:-1], now, minutes)
 
 
 def market_regime(daily, stress_raised=1.5, stress_high=2.0):
@@ -148,12 +160,10 @@ def market_regime(daily, stress_raised=1.5, stress_high=2.0):
 
 
 def allowed_sides(side, bias):
-    """The directions to trade and whether a breakout needs the extra buffer."""
+    """The directions to trade: the bias's own, both when it is neutral, or the override."""
     if side != "auto":
-        return SIDES[side], False
-    if bias == "neutral":
-        return SIDES["both"], True
-    return SIDES[bias], False
+        return SIDES[side]
+    return SIDES["both"] if bias == "neutral" else SIDES[bias]
 
 
 def load_agent_view(day, path=None):
@@ -198,12 +208,14 @@ def find_trigger(bars, day, or_minutes, high, low, sides, buffer=0.0):
     return None, None
 
 
-def plan_trade(direction, price, or_high, or_low, stop_mode, rr, risk, point_value,
-               min_size, step, decimals):
+def plan_trade(direction, price, or_high, or_low, stop_mode, target_mode, rr, min_rr, risk,
+               point_value, min_size, step, decimals):
     """Stop, target and size for a trade at price. Raises BotError when it does not fit.
 
     The stop sits at the range midpoint or at the far edge of the range (the
-    low for a buy, the high for a sell), rounded away from the price.
+    low for a buy, the high for a sell), rounded away from the price. The
+    target is the measured move (the range height beyond the broken level)
+    or rr times the risk; under min_rr reward:risk there is no trade.
     """
     factor = 10 ** decimals
     long = direction == "BUY"
@@ -213,15 +225,23 @@ def plan_trade(direction, price, or_high, or_low, stop_mode, rr, risk, point_val
     dist = price - stop if long else stop - price
     if dist <= 0:
         raise BotError(f"Stop {stop} liegt auf der falschen Seite des Einstiegs {price}")
-    target = price + rr * dist if long else price - rr * dist
+    if target_mode == "measured":
+        width = or_high - or_low
+        target = or_high + width if long else or_low - width
+    else:
+        target = price + rr * dist if long else price - rr * dist
     target = math.ceil(target * factor) / factor if long else math.floor(target * factor) / factor
+    reward = target - price if long else price - target
+    if reward / dist < min_rr:
+        raise BotError(f"Chance zu Risiko {reward / dist:.2f} : 1 unter dem Minimum {min_rr:g} : 1 "
+                       f"(Ziel {target}, Stop {stop}, Einstieg {price}). Zu spät oder zu wenig Luft. Kein Trade.")
     raw = risk / (dist * point_value)
     size = round(math.floor(raw / step + 1e-9) * step, 6)
     if size < min_size:
         raise BotError(f"Stop zu weit weg: {dist:.2f} Punkte bei max. Verlust {risk} ergibt "
                        f"Größe {raw:.4f}, das Minimum ist {min_size}. Kein Trade.")
     return {"direction": direction, "entry": price, "stop": stop, "target": target, "size": size,
-            "max_loss": round(size * dist * point_value, 2)}
+            "rr": round(reward / dist, 2), "max_loss": round(size * dist * point_value, 2)}
 
 
 def range_problem(rng, regime, max_or_atr):
@@ -359,7 +379,7 @@ def sleep_until(t):
 def read_market(api, args, now):
     daily = closed_bars(api.bars(args.epic, 1440, 60), now, 1440)
     regime = market_regime(daily, args.stress_raised, args.stress_high)
-    sides, buffered = allowed_sides(args.side, regime["bias"])
+    sides = allowed_sides(args.side, regime["bias"])
     if args.agents:
         view = load_agent_view(now.astimezone(NY).date())
         log(f"Agenten-Desk ({view['ticker']}): Rating {view['rating']} -> {view['bias']}.")
@@ -367,15 +387,14 @@ def read_market(api, args, now):
     log(f"Marktlage {args.epic}: Trend {regime['bias']}, Stress {regime['stress']} "
         f"(ATR 5/20 = {regime['stress_ratio']}), ATR {regime['atr']:.1f}, "
         f"Vortagesschluss {regime['prev_close']:.1f}. "
-        f"Erlaubt: {', '.join(WORDS[s] for s in sorted(sides)) or 'nichts'}"
-        f"{' mit Puffer' if buffered and sides else ''}.")
-    return regime, sides, buffered
+        f"Erlaubt: {', '.join(WORDS[s] for s in sorted(sides)) or 'nichts'}.")
+    return regime, sides
 
 
 def regime_cmd(api, args):
     now = datetime.datetime.now(datetime.timezone.utc)
     day = now.astimezone(NY).date()
-    regime, _, _ = read_market(api, args, now)
+    regime, _ = read_market(api, args, now)
     risk = risk_for(regime, args.risk)
     log(f"Risiko heute: {risk:g} pro Trade" + (" (kein Trade bei hohem Stress)" if not risk else ""))
     rng = opening_range(closed_bars(api.bars(args.epic, args.interval), now, args.interval),
@@ -413,7 +432,7 @@ def run(api, args):
         return 0
 
     try:
-        regime, sides, buffered = read_market(api, args, now)
+        regime, sides = read_market(api, args, now)
     except BotError as e:
         log(str(e))
         return 0
@@ -434,7 +453,7 @@ def run(api, args):
         if now >= cutoff:
             log("Einstiegsfenster vorbei, kein Ausbruch. Heute kein Trade.")
             return 0
-        bars = closed_bars(api.bars(args.epic, args.interval), now, args.interval)
+        bars = complete_bars(api.bars(args.epic, args.interval), now, args.interval)
         if rng is None:
             rng = opening_range(bars, day, args.or_minutes, args.interval)
             if rng is None:
@@ -448,11 +467,11 @@ def run(api, args):
                     log(problem)
                     return 0
         if rng:
-            buffer = args.buffer * (rng[0] - rng[1]) if buffered else 0.0
+            buffer = args.buffer * (rng[0] - rng[1])
             bar, direction = find_trigger(bars, day, args.or_minutes, rng[0], rng[1], sides, buffer)
             if bar:
                 bar_end = bar["start"] + datetime.timedelta(minutes=args.interval)
-                if now - bar_end > datetime.timedelta(minutes=args.interval + 2):
+                if now - bar_end > datetime.timedelta(minutes=args.interval + 3):
                     log(f"Ausbruch schon um {de(bar_end)}, zu alt für einen Einstieg. Kein Trade.")
                     return 0
                 side = "über dem Hoch" if direction == "BUY" else "unter dem Tief"
@@ -465,7 +484,7 @@ def run(api, args):
             if bars:
                 last = bars[-1]["close"]
                 log(f"Wartet: letzter Schluss {last:.2f} (Range {rng[1]:.2f} - {rng[0]:.2f}"
-                    f"{f', Puffer {buffer:.1f}' if buffer else ''}).")
+                    f", Puffer {buffer:.1f}).")
         step = args.interval * 60
         wake = (int(now.timestamp()) // step + 1) * step + 15
         sleep_until(datetime.datetime.fromtimestamp(wake, datetime.timezone.utc))
@@ -481,8 +500,9 @@ def enter(api, args, direction, rng, regime, risk, state):
         return None
     price = rules["ask"] if direction == "BUY" else rules["bid"]
     try:
-        plan = plan_trade(direction, price, rng[0], rng[1], args.stop, args.rr, risk,
-                          args.point_value, rules["min_size"], rules["step"], rules["decimals"])
+        plan = plan_trade(direction, price, rng[0], rng[1], args.stop, args.target, args.rr,
+                          args.min_rr, risk, args.point_value, rules["min_size"], rules["step"],
+                          rules["decimals"])
     except BotError as e:
         log(str(e))
         return None
@@ -491,7 +511,7 @@ def enter(api, args, direction, rng, regime, risk, state):
         log(problem)
         return None
     log(f"Plan: {WORDS[direction]} {plan['size']} @ ~{plan['entry']}, Stop {plan['stop']}, "
-        f"Ziel {plan['target']}, max. Verlust ~{plan['max_loss']} {rules['currency'] or ''}.")
+        f"Ziel {plan['target']}, CRV {plan['rr']} : 1, max. Verlust ~{plan['max_loss']} {rules['currency'] or ''}.")
     if args.dry_run:
         log("DRY-RUN: keine Order gesendet.")
         state["trades"].append({**plan, "dry_run": True})
@@ -566,10 +586,13 @@ def main(argv=None):
                    help="profit or loss per point for size 1 (default 1)")
     p.add_argument("--stop", choices=["mid", "edge"], default="mid",
                    help="stop at the range midpoint or its far edge (default mid)")
-    p.add_argument("--rr", type=float, default=2.0, help="target in R (default 2)")
-    p.add_argument("--buffer", type=float, default=0.1,
-                   help="with a neutral bias, the close must clear the range by this share "
-                        "of its width (default 0.1)")
+    p.add_argument("--target", choices=["measured", "r"], default="measured",
+                   help="measured move from the broken level (default) or --rr times the risk")
+    p.add_argument("--rr", type=float, default=2.0, help="target in R with --target r (default 2)")
+    p.add_argument("--min-rr", type=float, default=1.5,
+                   help="skip a trade under this reward:risk at the actual price (default 1.5)")
+    p.add_argument("--buffer", type=float, default=0.05,
+                   help="the close must clear the range by this share of its width (default 0.05)")
     p.add_argument("--max-or-atr", type=float, default=0.5,
                    help="skip the day when the range is wider than this times the ATR (default 0.5)")
     p.add_argument("--max-target-atr", type=float, default=1.0,
@@ -580,7 +603,8 @@ def main(argv=None):
                    help="ATR 5/20 ratio that stops trading for the day (default 2.0)")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--interval", type=int, choices=[1, 5], default=5)
-    p.add_argument("--no-entries-after", type=hhmm, default=hhmm("15:30"), help="New York time")
+    p.add_argument("--no-entries-after", type=hhmm, default=hhmm("11:30"),
+                   help="New York time (default 11:30, 17:30 in Germany)")
     p.add_argument("--flat-by", type=hhmm, default=hhmm("15:55"), help="New York time")
     p.add_argument("--max-trades", type=int, default=1, help="trades per day (default 1)")
     p.add_argument("--dry-run", action="store_true", help="log decisions, send no orders")
