@@ -15,6 +15,11 @@ Runs one trading day on its own, long or short:
 4. Sends the stop and the target with the order, skips a target too far for
    the day's ATR, and closes the position at the flat-by time.
 
+With --agents it also needs today's call from bots/agent_desk.py (the
+TradingAgents team): it trades only the direction both the market read and
+the desk agree on, and not at all when the desk says Hold or has no call
+for today.
+
 One trade a day. Demo account by default; the live account needs both --live
 and CAPITAL_LIVE=yes. --dry-run logs every decision and sends no order.
 
@@ -50,6 +55,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 STATE_FILE = ROOT / "trader" / "state" / "capital_orb.json"
 KILL_SWITCH = ROOT / "trader" / "STOP"
+AGENT_VIEW = ROOT / "trader" / "state" / "agent_view.json"
 NY = ZoneInfo("America/New_York")
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -148,6 +154,25 @@ def allowed_sides(side, bias):
     if bias == "neutral":
         return SIDES["both"], True
     return SIDES[bias], False
+
+
+def load_agent_view(day, path=None):
+    """Today's call from bots/agent_desk.py. Raises BotError when there is none for today."""
+    path = path or AGENT_VIEW
+    try:
+        view = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise BotError(f"Keine Einschätzung vom Agenten-Desk ({path}). "
+                       "Erst bots/agent_desk.py laufen lassen. Kein Trade.")
+    if view.get("date") != day.isoformat():
+        raise BotError(f"Die Einschätzung vom Agenten-Desk ist vom {view.get('date')}, "
+                       f"nicht von heute ({day}). Kein Trade.")
+    return view
+
+
+def combine_sides(sides, agent_bias):
+    """The directions both the market read and the agent desk allow."""
+    return sides & SIDES.get(agent_bias, set())
 
 
 def opening_range(bars, day, or_minutes, minutes):
@@ -335,11 +360,15 @@ def read_market(api, args, now):
     daily = closed_bars(api.bars(args.epic, 1440, 60), now, 1440)
     regime = market_regime(daily, args.stress_raised, args.stress_high)
     sides, buffered = allowed_sides(args.side, regime["bias"])
+    if args.agents:
+        view = load_agent_view(now.astimezone(NY).date())
+        log(f"Agenten-Desk ({view['ticker']}): Rating {view['rating']} -> {view['bias']}.")
+        sides = combine_sides(sides, view["bias"])
     log(f"Marktlage {args.epic}: Trend {regime['bias']}, Stress {regime['stress']} "
         f"(ATR 5/20 = {regime['stress_ratio']}), ATR {regime['atr']:.1f}, "
         f"Vortagesschluss {regime['prev_close']:.1f}. "
-        f"Erlaubt: {', '.join(WORDS[s] for s in sorted(sides))}"
-        f"{' mit Puffer' if buffered else ''}.")
+        f"Erlaubt: {', '.join(WORDS[s] for s in sorted(sides)) or 'nichts'}"
+        f"{' mit Puffer' if buffered and sides else ''}.")
     return regime, sides, buffered
 
 
@@ -383,7 +412,14 @@ def run(api, args):
         log("Heute schon gehandelt. Keine weiteren Einstiege.")
         return 0
 
-    regime, sides, buffered = read_market(api, args, now)
+    try:
+        regime, sides, buffered = read_market(api, args, now)
+    except BotError as e:
+        log(str(e))
+        return 0
+    if not sides:
+        log("Marktlage und Agenten-Desk erlauben heute keine gemeinsame Richtung. Kein Trade.")
+        return 0
     risk = risk_for(regime, args.risk)
     if not risk:
         log("Stress hoch: Die Schwankungen sind doppelt so groß wie üblich. Heute kein Trade.")
@@ -522,6 +558,8 @@ def main(argv=None):
     p.add_argument("--epic", default="US100", help="Capital.com market (default US100)")
     p.add_argument("--side", choices=["auto", "long", "short", "both"], default="auto",
                    help="auto follows the trend bias (default); the others override it")
+    p.add_argument("--agents", action="store_true",
+                   help="also follow today's call from bots/agent_desk.py")
     p.add_argument("--risk", type=float, default=50.0,
                    help="max loss per trade in the instrument's currency (default 50)")
     p.add_argument("--point-value", type=float, default=1.0,

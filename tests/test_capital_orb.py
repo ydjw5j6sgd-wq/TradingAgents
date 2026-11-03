@@ -266,3 +266,45 @@ def test_a_full_day_goes_short_in_a_downtrend(monkeypatch, tmp_path):
     assert broker.orders == [("SELL", 4.5, 103.5, 70.5)]
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["trades"][0]["direction"] == "SELL" and state["trades"][0]["open"] is False
+
+
+def run_short_day(monkeypatch, tmp_path, extra_args, view=None):
+    """The downtrend day above, with an optional agent-desk call; returns the broker."""
+    clock = Clock(datetime.datetime(2026, 11, 3, 14, 35, tzinfo=datetime.timezone.utc))
+    monkeypatch.setattr(orb.datetime, "datetime", clock.datetime)
+    monkeypatch.setattr(orb.time, "sleep", clock.sleep)
+    monkeypatch.setattr(orb, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(orb, "KILL_SWITCH", tmp_path / "STOP")
+    monkeypatch.setattr(orb, "AGENT_VIEW", tmp_path / "agent_view.json")
+    if view is not None:
+        (tmp_path / "agent_view.json").write_text(json.dumps(view))
+    intraday = ROWS[:3] + [row("2026-11-03T14:45:00", 101, 112, 96, 108),
+                           row("2026-11-03T14:50:00", 108, 111, 90, 93)]
+    broker = FakeBroker(clock, daily(range(160, 120, -1), [40] * 40), intraday)
+    broker.login = lambda: None
+    monkeypatch.setattr(orb, "Capital", lambda *a: broker)
+    for name in ("CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_API_PASSWORD"):
+        monkeypatch.setenv(name, "x")
+    assert orb.main(["run", "--max-or-atr", "1", "--max-target-atr", "2", *extra_args]) == 0
+    return broker
+
+
+def test_agents_agreeing_with_the_market_let_the_trade_through(monkeypatch, tmp_path):
+    view = {"date": "2026-11-03", "ticker": "QQQ", "rating": "Underweight", "bias": "short"}
+    assert run_short_day(monkeypatch, tmp_path, ["--agents"], view).orders[0][0] == "SELL"
+
+
+@pytest.mark.parametrize("view", [
+    {"date": "2026-11-03", "ticker": "QQQ", "rating": "Buy", "bias": "long"},
+    {"date": "2026-11-03", "ticker": "QQQ", "rating": "Hold", "bias": "none"},
+    {"date": "2026-11-02", "ticker": "QQQ", "rating": "Sell", "bias": "short"},
+    None,
+])
+def test_agents_disagreeing_holding_stale_or_missing_mean_no_trade(monkeypatch, tmp_path, view):
+    assert run_short_day(monkeypatch, tmp_path, ["--agents"], view).orders == []
+
+
+def test_combine_sides_keeps_only_the_shared_direction():
+    assert orb.combine_sides({"BUY", "SELL"}, "short") == {"SELL"}
+    assert orb.combine_sides({"BUY"}, "short") == set()
+    assert orb.combine_sides({"BUY"}, "none") == set()

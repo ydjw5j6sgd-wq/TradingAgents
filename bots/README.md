@@ -35,6 +35,51 @@ Der Bot handelt höchstens einmal am Tag und eröffnet nach 21:30 Uhr keine neue
 An Wochenenden und US-Feiertagen handelt er nicht, an verkürzten Handelstagen
 verschiebt er die Zeiten nach vorn.
 
+## Mit Agenten-Desk (`--agents`)
+
+`bots/agent_desk.py` lässt vor Börsenstart das ganze TradingAgents-Team über den
+Nasdaq 100 beraten. Weil das Framework mit Aktien und ETFs arbeitet, nimmt es dafür
+den ETF `QQQ`. Das Team besteht aus:
+
+- **Analysten** für Fundamentaldaten, Stimmung (StockTwits, Reddit), Nachrichten und Charttechnik
+- **Bull- und Bear-Researchern**, die gegeneinander argumentieren
+- **Trader, Risiko-Team und Portfolio Manager**, die am Ende entscheiden
+
+Die Entscheidung des Portfolio Managers wird gespeichert und gibt die Richtung des Tages vor:
+
+| Rating | Richtung für den Bot |
+| --- | --- |
+| Buy, Overweight | nur long |
+| Underweight, Sell | nur short |
+| Hold oder kein lesbares Rating | kein Trade |
+
+Mit `--agents` handelt der Bot nur in die Richtung, in die **Marktlage und Agenten-Desk
+gemeinsam** zeigen. Widersprechen sie sich, steht Hold, oder fehlt die Einschätzung von heute,
+handelt er nicht.
+
+**Täglicher Ablauf** (deutsche Zeit, montags bis freitags):
+
+```bash
+# ca. 14:00 Uhr: Agenten-Desk (dauert einige Minuten, kostet je nach Modell etwa 1-2 USD)
+python3 bots/agent_desk.py
+# ca. 15:35 Uhr: Bot mit Agenten-Filter
+python3 bots/capital_orb.py run --agents
+```
+
+`python3 bots/agent_desk.py --show` zeigt die gespeicherte Entscheidung samt Begründung.
+
+Für den Desk musst du TradingAgents installieren (`pip install .` im Repo) und einen KI-Anbieter
+einstellen, zum Beispiel Claude:
+
+```
+TRADINGAGENTS_LLM_PROVIDER=anthropic
+TRADINGAGENTS_DEEP_THINK_LLM=claude-opus-5
+TRADINGAGENTS_QUICK_THINK_LLM=claude-fable-5
+ANTHROPIC_API_KEY=...
+```
+
+Die Modellnamen kannst du anpassen. Die Hauptanleitung des Repos (`README.md`) listet die übrigen Anbieter.
+
 ## Einrichtung
 
 1. **Den API-Schlüssel erstellst du bei Capital.com** unter Einstellungen > API-Integrationen.
