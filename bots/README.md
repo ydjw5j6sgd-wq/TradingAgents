@@ -86,20 +86,49 @@ ANTHROPIC_API_KEY=...
 
 Die Modellnamen kannst du anpassen. Die Hauptanleitung des Repos (`README.md`) listet die übrigen Anbieter.
 
-## Morgenanalyse (`morning_brief.py`)
+## NAS100 Day-Trading: Morgenanalyse und Live-Signale
+
+Für den täglichen Handel im Nasdaq 100 gibt es ein eigenes Setup, den **VWAP-Pullback**
+(`vwap_setup.py`). Grundlage ist der VWAP, der volumengewichtete Durchschnittskurs seit Börsenstart:
+
+- **BUY:** Der VWAP steigt (höher als vor 30 Minuten), die vorige Kerze schloss über ihm,
+  und die aktuelle Kerze taucht bis an den VWAP ab, schließt aber wieder darüber.
+  Der Stop liegt knapp unter dem Tief dieser Kerze.
+- **SELL:** spiegelbildlich unter einem fallenden VWAP.
+- **Ziel:** 1,5-mal das Risiko. Stops unter 15 Punkten werden ausgelassen, die frisst der Spread.
+- Signale kommen von 16:10 bis 21:05 Uhr deutscher Zeit, immer nur eine offene Position,
+  höchstens 3 pro Tag. Glattgestellt wird bis 21:55 Uhr.
+- **Trendfilter (Standard):** Im Aufwärtstrend nur BUY, im Abwärtstrend nur SELL,
+  in einer Seitwärtsphase beides. Mit `--no-trend-filter` kommen beide Richtungen, also mehr Signale.
+
+Im Rückblick über 59 Handelstage, mit 2 Punkten Spread pro Trade:
+
+| | Trades/Tag | Ø pro Trade |
+| --- | --- | --- |
+| mit Trendfilter | 0,6 | +0,25 R |
+| ohne Trendfilter | 1,1 | +0,06 R |
+
+Zum Vergleich lag der Opening-Range-Ausbruch des Capital.com-Bots über denselben Zeitraum bei −0,26 R.
+Beide VWAP-Varianten waren in der ersten Hälfte des Zeitraums bei null oder im Minus.
+Garantiert ist also nichts.
 
 ```bash
-python3 bots/morning_brief.py          # Analyse auf Deutsch
-python3 bots/morning_brief.py --json   # dieselben Zahlen als JSON
+python3 bots/morning_brief.py                       # Morgenanalyse: BUY, SELL, BEIDE oder ABWARTEN
+python3 bots/live_signals.py next                   # wartet aufs nächste Signal (mit Trendfilter)
+python3 bots/live_signals.py next --no-trend-filter # beide Richtungen
+python3 bots/live_signals.py status                 # Signale von heute
 ```
 
-Die Analyse braucht keine Zugangsdaten, nur die kostenlosen Yahoo-Kurse. Sie zeigt:
+`live_signals.py next` endet beim nächsten Ereignis: `SIGNAL` (BUY oder SELL mit Einstieg,
+Stop, Ziel und CRV), `CLOSED` (Stop, Ziel oder Glattstellen) oder `END` (Schluss für heute).
+Eine Kerze zählt erst, wenn Yahoos Daten über ihr Ende hinausreichen. Ein Fehlsignal
+durch eine halb fertige Kerze ist so ausgeschlossen. Die Kurse sind die des Index:
+Beim CFD übernimmst du Stop und Ziel als Abstand in Punkten.
 
-- **Marktphase:** Trend, Stress, Lage in der 20-Tage-Spanne
-- **Wichtige Marken:** Vortag, 5-Tage-Spanne, ATR und die Eröffnung, auf die der Future über Nacht hindeutet
-- **Plan:** typische Range-Breite und das Chance-Risiko-Verhältnis in Punkten, das die Regeln erlauben
-- **Rückblick:** wie die Regeln des Bots auf den letzten rund 60 Handelstagen long und short abgeschnitten haben
-- **Empfehlung:** LONG, SHORT, BEIDE oder ABWARTEN
+**Hebel und Größe:** Der Hebel (zum Beispiel 1:20) legt nur die Margin fest, nicht das Risiko.
+Das Risiko bestimmt die Größe: Bei 1 % Risiko pro Trade und einem typischen Stop von 27 Punkten
+sind es je 10 € Risiko etwa 0,37 Kontrakte, wenn ein Punkt bei Größe 1 einen Euro wert ist.
+Im Rückblick gab es bis zu 7 Verluste in Folge.
 
 ## Einrichtung
 

@@ -1,0 +1,109 @@
+"""Tests for bots/vwap_setup.py and bots/live_signals.py: the NAS100 VWAP pullback, offline."""
+
+import datetime
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+_BOTS = Path(__file__).resolve().parent.parent / "bots"
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(name, _BOTS / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+vs = _load("vwap_setup")
+ls = _load("live_signals")
+DAY = datetime.date(2026, 11, 3)
+
+
+def bar(o, h, l, c, v=100):
+    return {"o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+def rising(n=8, start=100.0, step=10.0):
+    """n bars climbing steadily, each closing well above the VWAP."""
+    return {k: bar(start + k * step, start + k * step + 5, start + k * step - 5, start + k * step + 4)
+            for k in range(n)}
+
+
+def test_vwap_is_volume_weighted_typical_price():
+    vw = vs.session_vwap({0: bar(0, 12, 6, 9, 100), 1: bar(0, 30, 24, 27, 300)})
+    assert vw[0] == pytest.approx(9) and vw[1] == pytest.approx((9 * 100 + 27 * 300) / 400)
+
+
+def test_buy_on_a_dip_to_a_rising_vwap_that_closes_back_above():
+    s = rising()
+    s[8] = bar(150, 185, 120, 182)  # dips through the VWAP, closes above it
+    sig = vs.pullback(s, 8)
+    assert sig["side"] == "BUY" and sig["entry"] == 182
+    assert sig["stop"] == pytest.approx(120 - 6.5)
+    assert sig["target"] == pytest.approx(182 + 1.5 * (182 - 113.5))
+
+
+def test_no_signal_without_the_dip_or_with_a_tight_stop():
+    s = rising()
+    s[8] = bar(180, 190, 178, 188)  # never touches the VWAP
+    assert vs.pullback(s, 8) is None
+    s = rising()
+    s[8] = bar(150, 160, 150, 159)
+    assert vs.pullback(s, 8, min_risk=1000) is None
+
+
+def test_sell_mirrors_on_a_falling_vwap():
+    s = {k: bar(300 - k * 10, 305 - k * 10, 295 - k * 10, 296 - k * 10) for k in range(8)}
+    s[8] = bar(240, 290, 210, 213)  # pokes up through the VWAP, closes under it
+    sig = vs.pullback(s, 8)
+    assert sig["side"] == "SELL" and sig["stop"] == pytest.approx(290 + 8)
+
+
+def test_outcome_stop_first_target_and_flat():
+    sig = {"slot": 8, "side": "BUY", "entry": 100, "stop": 90, "target": 115, "risk": 10, "rr": 1.5}
+    assert vs.outcome({9: bar(100, 120, 85, 110)}, sig)[:2] == ("stop", -1.0)
+    assert vs.outcome({9: bar(100, 116, 95, 110)}, sig)[:2] == ("target", 1.5)
+    assert vs.outcome({9: bar(100, 105, 95, 104)}, sig, last_slot=9) == (None, None, None)
+    flat = vs.outcome({9: bar(100, 105, 95, 104), 76: bar(104, 106, 101, 105)}, sig)
+    assert flat == ("flat", 0.5, 76)
+
+
+def test_backtest_charges_the_spread_per_trade():
+    s = rising(70)
+    s[8] = bar(150, 185, 120, 182)
+    stats = vs.backtest({"2026-11-02": s}, {"2026-11-02": "long"}, cost=2.0)
+    assert stats["trades"] >= 1 and stats["sessions"] == 1
+
+
+def test_live_step_signals_only_on_a_fresh_complete_bar_then_closes():
+    s = rising()
+    s[8] = bar(150, 185, 120, 182)
+    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
+    kind, line = ls.step(state, s, 8, DAY, True, 1.5, 15, 3)
+    assert kind == "SIGNAL" and line.startswith("BUY (long) NAS100 – Kerze bis 16:15 Uhr")
+    s[9] = bar(182, 300, 181, 290)
+    kind, line = ls.step(state, s, 9, DAY, True, 1.5, 15, 3)
+    assert kind == "CLOSED" and "ZIEL erreicht" in line and line.endswith("+1,50 R.")
+    assert state["open"] is None and len(state["trades"]) == 1
+
+
+def test_live_step_respects_the_trend_filter_and_the_daily_limit():
+    s = rising()
+    s[8] = bar(150, 185, 120, 182)
+    state = {"date": DAY.isoformat(), "bias": "short", "seen": None, "open": None, "trades": []}
+    assert ls.step(state, s, 8, DAY, True, 1.5, 15, 3) is None
+    state = {"date": DAY.isoformat(), "bias": "short", "seen": None, "open": None, "trades": []}
+    assert ls.step(state, s, 8, DAY, False, 1.5, 15, 3)[0] == "SIGNAL"
+    full = {"date": DAY.isoformat(), "bias": "long", "seen": 7, "open": None, "trades": [{}, {}, {}]}
+    assert ls.step(full, s, 8, DAY, True, 1.5, 15, 3)[0] == "END"
+    late = {"date": DAY.isoformat(), "bias": "long", "seen": 66, "open": None, "trades": []}
+    assert ls.step(late, s, 67, DAY, True, 1.5, 15, 3)[0] == "END"
+
+
+def test_complete_slot_needs_yahoo_data_past_the_bar_end():
+    s = {0: {"t": 1000}, 1: {"t": 1300}}
+    assert ls.complete_slot(s, data_time=1650, now=2000) == 1
+    assert ls.complete_slot(s, data_time=1500, now=2000) == 0
+    assert ls.complete_slot(s, data_time=1200, now=2000) == -1
