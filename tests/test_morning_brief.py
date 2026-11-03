@@ -57,3 +57,43 @@ def test_german_text_has_the_call_first():
     text = mb.german(b)
     assert text.splitlines()[2] == "EMPFEHLUNG: BUY"
     assert "Future über Nacht -0,25 %" in text and "Ø +0,25 R" in text and "keine Trades" in text
+
+
+def b4(h, l, c=None):
+    return {"h": h, "l": l, "c": (h + l) / 2 if c is None else c}
+
+
+def test_ema_starts_at_the_first_value_and_follows():
+    assert mb.ema([10, 10, 10], 45) == [10, 10, 10]
+    line = mb.ema([0, 46], 45)
+    assert line[1] == pytest.approx(2.0)
+
+
+def test_swings_find_pivot_highs_and_lows():
+    bars = [b4(10, 5), b4(11, 6), b4(12, 7), b4(20, 8), b4(13, 7), b4(12, 6), b4(11, 1), b4(12, 2),
+            b4(13, 3), b4(14, 4)]
+    highs, lows = mb.swings(bars)
+    assert highs == [(3, 20)] and lows == [(6, 1)]
+
+
+def test_structure_turns_bearish_on_a_close_under_the_last_swing_low():
+    up = [b4(100 + i, 90 + i) for i in range(4)]
+    bars = up + [b4(110, 100), b4(106, 96), b4(105, 95), b4(104, 85), b4(106, 94), b4(107, 95),
+                 b4(108, 96), b4(103, 90), b4(99, 80, 81)]
+    st = mb.structure(bars)
+    assert st["bias"] == "short" and st["bos"] == 85 and st["choch"] == 110
+
+
+def test_nearest_levels_and_point_of_control():
+    bars = [b4(10, 5), b4(11, 6), b4(12, 7), b4(20, 8), b4(13, 7), b4(12, 6), b4(11, 1), b4(12, 2),
+            b4(13, 3), b4(14, 4)]
+    assert mb.nearest_levels(bars, 10) == (20, 1)
+    session = {0: {"h": 101, "l": 99, "c": 100, "v": 10}, 1: {"h": 121, "l": 119, "c": 120, "v": 50}}
+    assert mb.point_of_control(session) == 120
+
+
+def test_chart_context_needs_enough_bars_and_applies_the_basis():
+    assert mb.chart_context([b4(1, 0)] * 10, 0, None) is None
+    bars = [{"h": 1010 + i, "l": 1000 + i, "c": 1005 + i} for i in range(80)]
+    ctx = mb.chart_context(bars, 100.0, None)
+    assert ctx["price"] == 984 and ctx["ema_rising"] and ctx["poc"] is None

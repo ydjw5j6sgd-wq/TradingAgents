@@ -12,6 +12,11 @@ overnight Nasdaq 100 future (NQ=F), then prints:
 - the plan for the VWAP pullback (bots/vwap_setup.py): signal window, typical
   stop and target in points, reward:risk, and a sizing example
 - a replay of the setup on the last sessions, with and without trend filter
+- chart context on 4-hour bars of the Nasdaq 100 future, moved to the index
+  level: the 45 EMA, the swing structure (break of structure, change of
+  character) and the nearest swing resistance and support, plus yesterday's
+  volume point of control. Context only: as filters they did not improve
+  the replay.
 
 Data is free, delayed and unofficial. This is tooling, not financial advice.
 
@@ -88,7 +93,78 @@ def event_hints(day):
     return hints
 
 
-def brief(days, yearly, future, today):
+def ema(values, n=45):
+    out, e = [], None
+    for v in values:
+        e = v if e is None else e + 2 / (n + 1) * (v - e)
+        out.append(e)
+    return out
+
+
+def swings(bars, side=3):
+    """Pivot highs and lows: (index, price) where a bar's high (low) tops (bottoms) side bars each way."""
+    highs, lows = [], []
+    for i in range(side, len(bars) - side):
+        window = bars[i - side:i + side + 1]
+        if bars[i]["h"] >= max(b["h"] for b in window):
+            highs.append((i, bars[i]["h"]))
+        if bars[i]["l"] <= min(b["l"] for b in window):
+            lows.append((i, bars[i]["l"]))
+    return highs, lows
+
+
+def structure(bars, side=3):
+    """Swing structure: bias from the last close beyond a confirmed swing, the level it broke
+    (break of structure) and the opposite swing whose break would flip it (change of character)."""
+    highs, lows = swings(bars, side)
+    bias, broke = "neutral", None
+    for i, b in enumerate(bars):
+        h = [p for j, p in highs if j + side < i]
+        l = [p for j, p in lows if j + side < i]
+        # a new break: the first in a direction, or a further one beyond the last broken level
+        if h and b["c"] > h[-1] and (bias != "long" or h[-1] > broke):
+            bias, broke = "long", h[-1]
+        if l and b["c"] < l[-1] and (bias != "short" or l[-1] < broke):
+            bias, broke = "short", l[-1]
+    flip = None
+    if bias == "short" and highs:
+        flip = highs[-1][1]
+    elif bias == "long" and lows:
+        flip = lows[-1][1]
+    return {"bias": bias, "bos": broke, "choch": flip}
+
+
+def nearest_levels(bars, price, side=3):
+    """The closest swing high above the price and swing low below it."""
+    highs, lows = swings(bars, side)
+    above = [p for _, p in highs if p > price] + [p for _, p in lows if p > price]
+    below = [p for _, p in lows if p < price] + [p for _, p in highs if p < price]
+    return (min(above) if above else None), (max(below) if below else None)
+
+
+def point_of_control(session, step=10):
+    """The price bin (step points wide) with the most volume in a session of 5-minute bars."""
+    profile = {}
+    for b in session.values():
+        level = round((b["h"] + b["l"] + b["c"]) / 3 / step) * step
+        profile[level] = profile.get(level, 0) + (b.get("v") or 0)
+    return max(profile, key=profile.get) if profile else None
+
+
+def chart_context(h4, basis, prev_session):
+    """4-hour EMA 45, structure and levels on the future, moved to the index by the basis."""
+    if len(h4) < 60:
+        return None
+    shifted = [{k: (v - basis if k in "hlc" else v) for k, v in b.items()} for b in h4[-300:]]
+    line = ema([b["c"] for b in shifted])
+    price = shifted[-1]["c"]
+    resist, support = nearest_levels(shifted[-120:], price)
+    return {"price": price, "ema45": line[-1], "ema_rising": line[-1] > line[-4],
+            **structure(shifted[-120:]), "resistance": resist, "support": support,
+            "poc": point_of_control(prev_session) if prev_session else None}
+
+
+def brief(days, yearly, future, today, h4=None, basis=0.0):
     past = [b for b in yearly if b["date"] < today.isoformat()]
     regime = orb.market_regime(past[-30:])
     sessions = {d: s for d, s in days.items() if d < today.isoformat()}
@@ -108,7 +184,8 @@ def brief(days, yearly, future, today):
                        "five_day_low": min(b["low"] for b in five), "atr": regime["atr"], "est_open": est_open},
             "plan": plan(today, filtered["median_risk"] or unfiltered["median_risk"] or 25.0),
             "replay": {"with_filter": filtered, "without_filter": unfiltered},
-            "events": event_hints(today)}
+            "events": event_hints(today),
+            "chart": chart_context(h4 or [], basis, sessions[max(sessions)] if sessions else None)}
 
 
 def num(x, digits=1):
@@ -156,6 +233,23 @@ def german(b):
                          f"{num(st['avg_r'], 2)} R, längste Verlustserie {st['worst_streak']}")
         else:
             lines.append(f"- {name}: keine Trades")
+    ch = b.get("chart")
+    if ch:
+        trend = {"long": "bullisch", "short": "bärisch", "neutral": "ohne klare Richtung"}[ch["bias"]]
+        lines += ["", "Chart-Kontext (4 Stunden, Future auf Index-Niveau umgerechnet)",
+                  f"- EMA 45: {num(ch['ema45'])}, {'steigend' if ch['ema_rising'] else 'fallend'}; "
+                  f"Kurs {num(ch['price'])} {'darüber' if ch['price'] > ch['ema45'] else 'darunter'}"]
+        if ch["bos"] is not None:
+            flip = (f"; Wechsel (CHoCH) erst bei Schluss {'über' if ch['bias'] == 'short' else 'unter'} "
+                    f"{num(ch['choch'])}") if ch["choch"] is not None else ""
+            lines.append(f"- Struktur {trend}: letzter Bruch (BOS) bei {num(ch['bos'])}{flip}")
+        if ch["resistance"] is not None:
+            lines.append(f"- Nächster Widerstand {num(ch['resistance'])}")
+        if ch["support"] is not None:
+            lines.append(f"- Nächste Unterstützung {num(ch['support'])}")
+        if ch["poc"] is not None:
+            lines.append(f"- Vortags-POC (meistes Volumen): {num(ch['poc'], 0)}")
+        lines.append("- Nur zur Orientierung: Als Filter brachten diese Werte im Test keinen Vorteil.")
     if b["events"]:
         lines += ["", "Termine"] + [f"- {e}" for e in b["events"]]
     lines += ["", "Kostenlose, verzögerte Yahoo-Daten. Werkzeug, keine Anlageberatung."]
@@ -164,10 +258,40 @@ def german(b):
 
 # ---------------------------------------------------------------- data
 
+def fetch_future_4h(yearly):
+    """Complete 4-hour bars of the Nasdaq 100 future on a UTC grid, and its basis to the index:
+    the future's close in the last hour before the index's last close, minus that close."""
+    tm, _ = vs.tools()
+    raw = json.loads(tm._get("https://query2.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=6mo&interval=1h"))
+    res = raw["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    hourly = [(t, q["open"][i], q["high"][i], q["low"][i], q["close"][i])
+              for i, t in enumerate(res["timestamp"]) if None not in (q["high"][i], q["low"][i], q["close"][i])]
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    bars = {}
+    for t, o, h, l, c in hourly:
+        k = t - t % 14400
+        b = bars.setdefault(k, {"t": k, "o": o, "h": h, "l": l, "c": c})
+        b["h"], b["l"], b["c"] = max(b["h"], h), min(b["l"], l), c
+    h4 = [bars[k] for k in sorted(bars) if k + 14400 <= now]
+    last = yearly[-1]
+    close_ts = datetime.datetime.combine(datetime.date.fromisoformat(last["date"]), datetime.time(15, 0),
+                                         tzinfo=NY).timestamp()
+    near = [c for t, o, h, l, c in hourly if t == close_ts]
+    basis = near[0] - last["close"] if near else 0.0
+    return h4, basis
+
+
 def fetch(now_utc):
     alerts = vs._load("alerts", vs.SKILLS / "trader-alerts" / "alerts.py")
     quotes, _ = alerts.get_quotes(["NQ=F"])
-    return vs.fetch_60d(now_utc), vs.fetch_yearly(), quotes.get("NQ=F")
+    yearly = vs.fetch_yearly()
+    past = [b for b in yearly if b["date"] < now_utc.astimezone(NY).date().isoformat()]
+    try:
+        h4, basis = fetch_future_4h(past)
+    except Exception:  # the chart context is optional; the brief stands without it
+        h4, basis = [], 0.0
+    return vs.fetch_60d(now_utc), yearly, quotes.get("NQ=F"), h4, basis
 
 
 def main(argv=None):
@@ -175,8 +299,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     now = datetime.datetime.now(datetime.timezone.utc)
-    days, yearly, future = fetch(now)
-    b = brief(days, yearly, future, now.astimezone(NY).date())
+    days, yearly, future, h4, basis = fetch(now)
+    b = brief(days, yearly, future, now.astimezone(NY).date(), h4, basis)
     print(json.dumps(b, indent=2, ensure_ascii=False) if args.json else german(b))
     return 0
 
