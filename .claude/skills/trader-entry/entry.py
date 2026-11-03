@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Entry Timer for trader-entry: watches a setup bar by bar and says the
-moment to get in. Standard library only. Long side only. It never places an order.
+moment to get in. Standard library only. Long and short signals. It never places an order.
 
     python3 entry.py check TSLA                          # opening-range breakout, 5-minute bars
     python3 entry.py check TSLA --now "2026-10-19 10:15" --offline TSLA.json
@@ -9,13 +9,18 @@ moment to get in. Standard library only. Long side only. It never places an orde
     python3 entry.py watch TSLA --every 30 --until 15:30  # one line per closed bar
     python3 entry.py watchlist                            # every hit in trader/watchlist.json
 
-Setups (v2 plans longs only):
+Setups (--side both by default; --side long or --side short for one side):
   orb    opening-range breakout. The range is the high and low of the first
          --or-minutes (default 15: the 9:30, 9:35 and 9:40 five-minute bars).
          It triggers on the first COMPLETED bar after the range that CLOSES
-         above the range high. A wick above the high is not a trigger.
-  level  the first completed bar that closes above --level (for example a
-         20-day high from trader-scanner).
+         above the range high (long) or below the range low (short). A wick
+         beyond the range is not a trigger.
+  level  the first completed bar that closes above --level (long) or below
+         --short-level (short), for example a 20-day high from trader-scanner.
+Reward:risk (CRV): stop at the opening-range midpoint, target at the measured
+  move (the range height added to the long level, taken from the short level).
+  On a trigger it prints the CRV and whether it meets --min-rr (default 1.5);
+  while waiting it prints the CRV a trigger exactly at each level would have.
   --min-volume-x X  the trigger bar also needs at least X times the average
          volume of the opening-range bars (the 9:30 bar carries the opening
          auction, so 1.0 is already a high bar).
@@ -406,7 +411,7 @@ def early_cutoff(day, t, close_dt):
 
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
+             min_volume_x=None, cfg=None, side="both", short_level=None, min_rr=1.5):
     """Pure function: the setup's status at now_utc from one session's bars."""
     cfg = cfg or dict(DEFAULTS)
     if interval not in INTERVALS:
@@ -416,14 +421,22 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
     if setup not in ("orb", "level"):
         raise EntryError("--setup is orb or level")
-    if setup == "level" and level is None:
-        raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
+    if side not in ("long", "short", "both"):
+        raise EntryError("--side is long, short or both")
+    if setup == "level" and level is None and short_level is None:
+        raise EntryError("--setup level needs --level PRICE (long) and/or --short-level PRICE (short)")
+    if setup == "level":
+        if side == "long" and level is None:
+            raise EntryError("--side long with --setup level needs --level PRICE")
+        if side == "short" and short_level is None:
+            raise EntryError("--side short with --setup level needs --short-level PRICE")
     n_or = or_minutes * 60 // step
     local = to_eastern(now_utc)
     day = local.date()
-    res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
+    res = {"symbol": chart["symbol"], "setup": setup, "side": {"long": "buy", "short": "sell"}.get(side, "both"), "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
-           "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
+           "phase": "", "reason": "", "opening_range": None, "level": None, "short_level": None,
+           "trigger": None, "rr": None, "prospects": {}, "min_rr": min_rr,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
            "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": []}
     dt = chart.get("data_time")
@@ -494,62 +507,126 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
             return res
         lvl = max(b["h"] for b in or_bars)
+        slvl = min(b["l"] for b in or_bars)
     else:
-        lvl = float(level)
+        lvl = None if level is None else float(level)
+        slvl = None if short_level is None else float(short_level)
+    if side == "long":
+        slvl = None
+    elif side == "short":
+        lvl = None
     res["level"] = r2(lvl)
+    res["short_level"] = r2(slvl)
+    orr = res["opening_range"] if (or_bars and len(or_bars) == n_or) else None
+
+    def hit(b):
+        if lvl is not None and b["c"] > lvl:
+            return "buy", lvl
+        if slvl is not None and b["c"] < slvl:
+            return "sell", slvl
+        return None, None
 
     first_slot = n_or if setup == "orb" else 0
     trig, thin = None, []
     for b in bars:
         if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
             continue
-        if b["c"] > lvl:
+        d, at = hit(b)
+        if d:
             vx = (b["v"] / avg_vol) if avg_vol else None
             if min_volume_x and (vx is None or vx < min_volume_x):
                 thin.append(b)
                 continue
-            trig = b
+            trig = (b, d, at)
             break
     last = bars[-1] if bars else None
     if last:
         res["last"] = {"bar_start": hm(last["et"]), "close": r2(last["c"]),
-                       "vs_level_pct": r2(100.0 * (last["c"] / lvl - 1))}
+                       "vs_level_pct": r2(100.0 * (last["c"] / lvl - 1)) if lvl else None,
+                       "vs_short_level_pct": r2(100.0 * (last["c"] / slvl - 1)) if slvl else None}
+    # what a trade at each trigger level would offer (entry exactly at the level)
+    res["prospects"] = {}
+    if lvl is not None:
+        res["prospects"]["buy"] = reward_risk("buy", lvl, lvl, orr, min_rr)
+    if slvl is not None:
+        res["prospects"]["sell"] = reward_risk("sell", slvl, slvl, orr, min_rr)
 
     if trig:
-        vx = (trig["v"] / avg_vol) if avg_vol else None
+        b, d, at = trig
+        vx = (b["v"] / avg_vol) if avg_vol else None
+        res["side"] = d
+        word = ("above" if d == "buy" else "below")
+        what = ("the range " + ("high" if d == "buy" else "low")) if setup == "orb" else "the level"
         res.update(status="triggered", phase="open" if local < close_dt else "after-close",
-                   reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
-        res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
-                          "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
-                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
-        res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
-        if dt and utc_of(dt) < eastern_to_utc(trig["end"]):
+                   reason="the %s bar closed %s %s" % (short(b["et"]), word, what))
+        res["trigger"] = {"side": d, "time": ampm(b["end"]), "close_time": hm(b["end"]), "bar_start": hm(b["et"]),
+                          "bar_index": b["slot"], "price": r2(b["c"]), "close": b["c"], "level": r2(at),
+                          "volume": b["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (b["c"] / at - 1))}
+        res["rr"] = reward_risk(d, b["c"], at, orr, min_rr)
+        res["minutes_since"] = int((local - b["end"]).total_seconds() // 60)
+        if dt and utc_of(dt) < eastern_to_utc(b["end"]):
             res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
                                 % to_eastern(utc_of(dt)).strftime("%H:%M:%S"))
         return res
     if not bars:
         res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
         return res
-    what = "close above the range high $%.2f" % lvl if setup == "orb" else "close above $%.2f" % lvl
+    whats = []
+    if lvl is not None:
+        whats.append("close above %s $%.2f" % ("the range high" if setup == "orb" else "the level", lvl))
+    if slvl is not None:
+        whats.append("close below %s $%.2f" % ("the range low" if setup == "orb" else "the short level", slvl))
+    what = " or ".join(whats)
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
         return res
     res["phase"] = "open"
-    if last["c"] > lvl and last in thin:
-        res["reason"] = "the %s bar closed above at $%.2f but on %.2fx the range's volume, under your %.2fx" % (
-            short(last["et"]), last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x)
-    elif last["c"] > lvl and last["end"] < before:
-        res["reason"] = "the %s bar closed above at $%.2f, but no entries before %s (config)" % (
-            short(last["et"]), last["c"], short(before))
+    d_last, at_last = hit(last)
+    if d_last and last in thin:
+        res["reason"] = "the %s bar closed %s at $%.2f but on %.2fx the range's volume, under your %.2fx" % (
+            short(last["et"]), "above" if d_last == "buy" else "below", last["c"],
+            last["v"] / avg_vol if avg_vol else 0, min_volume_x)
+    elif d_last and last["end"] < before:
+        res["reason"] = "the %s bar closed %s at $%.2f, but no entries before %s (config)" % (
+            short(last["et"]), "above" if d_last == "buy" else "below", last["c"], short(before))
     else:
-        gap = lvl - last["c"]
-        res["reason"] = "last close $%.2f (%s bar), $%.2f %s %s (%+.2f%%)" % (
-            last["c"], short(last["et"]), abs(gap), "under" if gap >= 0 else "over",
-            "the range high $%.2f" % lvl if setup == "orb" else "the level $%.2f" % lvl,
-            100.0 * (last["c"] / lvl - 1))
+        parts = []
+        if lvl is not None:
+            parts.append("$%.2f under %s $%.2f (long)" % (
+                lvl - last["c"], "the range high" if setup == "orb" else "the level", lvl))
+        if slvl is not None:
+            parts.append("$%.2f over %s $%.2f (short)" % (
+                last["c"] - slvl, "the range low" if setup == "orb" else "the short level", slvl))
+        res["reason"] = "last close $%.2f (%s bar): %s" % (last["c"], short(last["et"]), ", ".join(parts))
     return res
+
+
+def reward_risk(side, entry, level, orr, min_rr):
+    """Reward:risk of an opening-range trade entered at `entry`.
+    Stop: the opening-range midpoint. Target: the measured move, the range's
+    height added to (long) or taken from (short) the breakout level. None when
+    there is no complete range or the stop is on the wrong side of the entry."""
+    if not orr or not orr.get("complete"):
+        return None
+    hi, lo = float(orr["high"]), float(orr["low"])
+    height = hi - lo
+    if height <= 0:
+        return None
+    mid = (hi + lo) / 2.0
+    if side == "buy":
+        stop, target = mid, level + height
+        risk, reward = entry - stop, target - entry
+    else:
+        stop, target = mid, level - height
+        risk, reward = stop - entry, entry - target
+    if risk <= 0:
+        return None
+    rr = reward / risk
+    return {"side": side, "entry": r2(entry), "stop": r2(stop), "target": r2(target), "risk": r2(risk),
+            "reward": r2(reward), "rr": r2(rr), "min_rr": min_rr, "ok": rr >= min_rr,
+            "stop_rule": "opening-range midpoint", "target_rule": "measured move (range height from the level)"}
 
 
 def public(res):
@@ -561,9 +638,12 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"],
+            "side": t.get("side") or res.get("side") or "buy",
             "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
-            "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
+            "bar_index": t.get("bar_index"), "price": t.get("price"),
+            "level": t.get("level") if t else res.get("level"), "short_level": res.get("short_level"),
+            "reward_risk": res.get("rr"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
             "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
@@ -588,7 +668,12 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 def setup_name(res):
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
-    return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
+    parts = []
+    if res.get("level") is not None:
+        parts.append("close above $%.2f" % res["level"])
+    if res.get("short_level") is not None:
+        parts.append("close below $%.2f" % res["short_level"])
+    return " / ".join(parts) or "close beyond a level"
 
 
 def describe(res):
@@ -610,10 +695,15 @@ def describe(res):
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
-            t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
+        long_ = t["side"] == "buy"
+        out.append("TRIGGERED %s %s at $%.2f: the %s bar (bar %d) closed %s %s $%.2f (%+.2f%%%s)." % (
+            "LONG" if long_ else "SHORT", t["time"], t["price"],
+            short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+            "above" if long_ else "below",
+            ("the range high" if long_ else "the range low") if res["setup"] == "orb" else "the level",
+            t["level"], t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+        out.append(rr_line(res.get("rr"), res.get("min_rr")))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
             out.append("That was %d minutes ago; the last close is $%.2f (%s bar). A late entry is a different "
@@ -625,8 +715,12 @@ def describe(res):
             out.append("Nothing was placed.")
         else:
             out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
-        out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
-                   "(exit.py plan --from trader/entry.json).")
+        if long_:
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
+        else:
+            out.append("Short signal: /trader-exit plans longs only, so set the stop and target yourself "
+                       "BEFORE you sell (the line above is a starting point).")
     else:
         out.append("%s  %s." % (label, res["reason"]))
         f = res.get("forming")
@@ -635,6 +729,11 @@ def describe(res):
         elif f and res["status"] == "waiting" and res["phase"] in ("open", "forming"):
             out.append("The %s bar is still forming ($%.2f so far, closes %s); it does not count until it closes." % (
                 f["bar_start"].lstrip("0"), f["price"], f["closes"]))
+        if res["status"] == "waiting" and res["phase"] == "open":
+            for d in ("buy", "sell"):
+                pr = (res.get("prospects") or {}).get(d)
+                if pr:
+                    out.append("If %s" % rr_line(pr, res.get("min_rr"), prospect=True))
         if res["status"] == "expired":
             out.append("No entry on this setup today. Nothing was placed.")
         if res.get("next_open"):
@@ -647,11 +746,24 @@ def describe(res):
     return out
 
 
+def rr_line(rr, min_rr, prospect=False):
+    """One line on reward:risk (CRV)."""
+    if not rr:
+        return "Reward:risk n/a: needs a complete opening range with the stop on the right side of the entry."
+    side = "long" if rr["side"] == "buy" else "short"
+    verdict = ("worth a look: %.2f:1 meets your %.2f:1 minimum" % (rr["rr"], min_rr) if rr["ok"]
+               else "too thin: %.2f:1 is under your %.2f:1 minimum" % (rr["rr"], min_rr))
+    head = ("%s triggers at $%.2f" % (side, rr["entry"])) if prospect else ("Reward:risk %s" % side)
+    return "%s: stop $%.2f (range midpoint), target $%.2f (measured move), risk $%.2f, reward $%.2f -> %s." % (
+        head, rr["stop"], rr["target"], rr["risk"], rr["reward"], verdict)
+
+
 def bar_line(b, res):
     """One watch line for a bar that just closed."""
     start = short(b["et"])
     orr = res.get("opening_range") or {}
     lvl = res.get("level")
+    slvl = res.get("short_level")
     t = res.get("trigger")
     n_or = orr.get("of") or 0
     if res["setup"] == "orb" and b["slot"] < n_or:
@@ -660,10 +772,17 @@ def bar_line(b, res):
         if b["slot"] == n_or - 1:
             note = "opening range set: high $%.2f, low $%.2f" % (orr["high"], orr["low"])
     elif t and t["bar_index"] == b["slot"]:
-        note = "TRIGGERED: closed above $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f" % (
-            lvl, t["pct_over"], t["time"], t["price"])
-    elif lvl is None:
+        rr = res.get("rr")
+        note = "TRIGGERED %s: closed %s $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f%s" % (
+            "LONG" if t["side"] == "buy" else "SHORT", "above" if t["side"] == "buy" else "below",
+            t["level"], t["pct_over"], t["time"], t["price"],
+            ("; CRV %.2f:1%s" % (rr["rr"], "" if rr["ok"] else " (under minimum)")) if rr else "")
+    elif lvl is None and slvl is None:
         note = ""
+    elif slvl is not None and b["c"] < slvl and (res["setup"] == "level" or b["slot"] >= n_or):
+        note = "below $%.2f" % slvl
+    elif slvl is not None and lvl is None:
+        note = "$%.2f over $%.2f" % (b["c"] - slvl, slvl)
     elif b["c"] > lvl:
         note = "above $%.2f" % lvl
         if res["setup"] == "level" or b["slot"] >= n_or:
@@ -782,16 +901,20 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 # ---------------------------------------------------------------- commands
 
 def _opts(a, cfg):
-    if a.side in ("sell", "short"):
-        raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup == "orb" and a.level is not None:
-        raise EntryError("--level is for --setup level (an orb's level is its range high)")
+    side = {"buy": "long", "long": "long", "sell": "short", "short": "short", "both": "both"}[a.side]
+    if a.setup == "orb" and (a.level is not None or a.short_level is not None):
+        raise EntryError("--level/--short-level are for --setup level (an orb uses its range high and low)")
+    if a.short_level is not None and a.short_level <= 0:
+        raise EntryError("--short-level must be a price above 0")
+    if a.min_rr <= 0:
+        raise EntryError("--min-rr must be above 0")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "side": side, "short_level": a.short_level,
+            "min_rr": a.min_rr}
 
 
 def _load(a, sym, now):
@@ -878,10 +1001,10 @@ def cmd_watchlist(a):
     for i, h in enumerate(hits):
         sym = str(h["symbol"]).upper()
         o = dict(opts)
-        if a.setup == "level" and o["level"] is None:
+        if a.setup == "level" and o["level"] is None and o["short_level"] is None:
             o["level"] = h.get("level")
         try:
-            if a.setup == "level" and o["level"] is None:
+            if a.setup == "level" and o["level"] is None and o["short_level"] is None:
                 raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
             if i and not a.offline:
                 _sleep(PAUSE)
@@ -892,7 +1015,8 @@ def cmd_watchlist(a):
     if a.json:
         print(json.dumps([{"symbol": s, "result": public(r) if r else None, "error": e} for s, r, e in rows], indent=2))
     else:
-        print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % ("SYMBOL", "STATUS", "TIME", "PRICE", "LEVEL", "LAST", "VS LEVEL"))
+        print("%-6s  %-9s  %-5s  %-8s  %-9s  %-9s  %-9s  %-9s  %s" % (
+            "SYMBOL", "STATUS", "SIDE", "TIME", "PRICE", "LEVEL", "LAST", "VS LEVEL", "CRV"))
         for s, r, e in rows:
             if e:
                 print("%-6s  error: %s" % (s, e))
@@ -900,11 +1024,16 @@ def cmd_watchlist(a):
             t = r.get("trigger") or {}
             last = r.get("last") or {}
             status = SHORT.get(r["phase"], r["status"]) if r["status"] != "triggered" else "triggered"
-            print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % (
-                s, status[:9], t.get("time") or "-", ("$%.2f" % t["price"]) if t else "-",
-                ("$%.2f" % r["level"]) if r.get("level") is not None else "-",
+            rr = r.get("rr")
+            lv = t.get("level") if t else r.get("level")
+            vs = last.get("vs_level_pct") if (not t or t.get("side") == "buy") else last.get("vs_short_level_pct")
+            print("%-6s  %-9s  %-5s  %-8s  %-9s  %-9s  %-9s  %-9s  %s" % (
+                s, status[:9], {"buy": "long", "sell": "short"}.get(t.get("side"), "-"), t.get("time") or "-",
+                ("$%.2f" % t["price"]) if t else "-",
+                ("$%.2f" % lv) if lv is not None else "-",
                 ("$%.2f" % last["close"]) if last else "-",
-                ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
+                ("%+.2f%%" % vs) if vs is not None else "-",
+                ("%.2f:1%s" % (rr["rr"], "" if rr["ok"] else "!")) if rr else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
         print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
@@ -921,7 +1050,11 @@ def main(argv=None):
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
-        p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
+        p.add_argument("--side", default="both", choices=["both", "buy", "long", "sell", "short"],
+                       help="which breakouts to signal (default both: long above the high, short below the low)")
+        p.add_argument("--short-level", type=float, help="the price to close below (--setup level, short side)")
+        p.add_argument("--min-rr", type=float, default=1.5,
+                       help="reward:risk (CRV) a trade needs to count as worth a look (default 1.5)")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
         p.add_argument("--config", default="trader/config.json")

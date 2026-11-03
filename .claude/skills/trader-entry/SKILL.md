@@ -4,15 +4,17 @@ description: >-
   Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
   Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
   first 15 minutes by default) and calls the entry on the first completed bar
-  that CLOSES above the range high, or above a level you give it (like a
-  20-day high from the scanner), with an optional volume check. Says waiting
-  and how far, triggered with the time and the price, expired, or not open
-  yet, and writes trader/entry.json for /trader-exit. Long side only. It never
-  places an order. Use when the user says "tell me when to get in", "watch
+  that CLOSES above the range high (long) or below the range low (short), or
+  beyond a level you give it (like a 20-day high from the scanner), with an
+  optional volume check. Says waiting and how far, triggered with the side,
+  the time and the price, expired, or not open yet, and gives the
+  reward:risk (CRV) of the trade: stop at the range midpoint, target at the
+  measured move. Writes trader/entry.json for /trader-exit. It never places
+  an order. Use when the user says "tell me when to get in", "watch
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER] [--side both|long|short] [--setup orb|level] [--interval 5m|1m] [--min-rr 1.5]"
 ---
 
 # trader-entry
@@ -30,6 +32,8 @@ people money, and a clean signal does not change that.
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA                  # 15-minute opening range, 5-minute bars
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --write          # also save trader/entry.json
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --level 371.20
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --short-level 352.10 --side short
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check "^NDX" --side long --min-rr 2   # longs only, CRV at least 2:1
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch TSLA --until 15:30    # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
@@ -53,12 +57,21 @@ day bar by bar without waiting.
 ## The rule
 
 - **Opening range (orb).** The high and low of the first 15 minutes: the
-  9:30, 9:35 and 9:40 five-minute bars, or fifteen 1-minute bars. The level
-  to beat is the range high.
-- **Level.** A price you give, like a 20-day high from `/trader-scanner`.
+  9:30, 9:35 and 9:40 five-minute bars, or fifteen 1-minute bars. Long
+  triggers above the range high, short below the range low.
+- **Level.** A price you give: `--level` for a long (like a 20-day high from
+  `/trader-scanner`), `--short-level` for a short.
+- **Side.** `--side both` (default) signals whichever breaks first;
+  `--side long` or `--side short` watches one side only.
 - **The trigger** is the first completed bar after the range that CLOSES
-  above the level. A wick above is not a trigger. A close exactly at the
-  level is not above it.
+  beyond the level. A wick beyond it is not a trigger. A close exactly at
+  the level is not beyond it.
+- **Reward:risk (CRV).** Stop at the opening-range midpoint, target at the
+  measured move (the range height beyond the breakout level). On a trigger it
+  prints entry, stop, target, risk, reward and the CRV, and says "worth a
+  look" when the CRV meets `--min-rr` (default 1.5) or "too thin" when it
+  does not. While waiting it shows the CRV a trigger right at each level
+  would have; the further a close runs past the level, the worse the CRV.
 - **The time** is that bar's close time (the 10:10 bar closes at 10:15 AM).
   The price is its close, to the cent.
 - **Only closed bars count.** A bar is closed when the clock passes its start
@@ -120,9 +133,12 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
   and can lag. Say so when a minute matters.
 - A signal is information, not an order, and not a promise. Nothing here
   promises winning trades or money.
-- Long side only. v2 plans longs only. If the user wants a short, say that.
-- One trigger per setup per day: the first close above. Later closes do not
-  reset it.
+- Long and short signals. `/trader-exit` still plans longs only: for a short
+  signal, the CRV line (stop and target) is the starting point, and the user
+  sets the stop and target themselves.
+- One trigger per setup per day: the first close beyond either level. Later
+  closes do not reset it.
+- A CRV is arithmetic on the range, not a probability. A 2:1 trade can still lose.
 - Never call an entry early because a bar looks like it will close above.
 
 ## What it never does
