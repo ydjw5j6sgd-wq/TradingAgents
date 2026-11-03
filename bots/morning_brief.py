@@ -74,7 +74,7 @@ def recommend(regime, filtered):
     return call, reason
 
 
-def plan(day, median_risk, rr=1.5):
+def plan(day, median_risk, rr=vs.TARGET_R):
     start = datetime.datetime.combine(day, datetime.time(9, 30), tzinfo=NY)
     at = lambda slot: (start + datetime.timedelta(minutes=5 * (slot + 1))).astimezone(BERLIN).strftime("%H:%M")
     return {"open_de": start.astimezone(BERLIN).strftime("%H:%M"), "first_signal_de": at(vs.FIRST_SLOT),
@@ -252,6 +252,8 @@ def german(b):
         f"glattstellen bis {pl['flat_de']} Uhr, max. 6 Signale, Pause nach 3 Verlusten",
         f"- Typischer Stop ~{num(pl['stop_pts'], 0)} Punkte, Ziel ~{num(pl['target_pts'], 0)} Punkte, "
         f"CRV {num(pl['rr'])} : 1",
+        f"- Bei +{num(vs.BE_AT * pl['stop_pts'], 0)} Punkten Stop auf Einstand, dann mit "
+        f"~{num(vs.TRAIL * pl['stop_pts'], 0)} Punkten Abstand nachziehen (Push kommt)",
         f"- Größe: je 10 € Risiko etwa {num(pl['size_per_10_eur'], 2)} Kontrakte "
         "(bei 1 € pro Punkt; Hebel ändert das Risiko nicht)",
         "",

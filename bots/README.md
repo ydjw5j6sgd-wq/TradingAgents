@@ -95,7 +95,10 @@ Für den täglichen Handel im Nasdaq 100 gibt es ein eigenes Setup, den **VWAP-P
   und die aktuelle Kerze taucht bis an den VWAP ab, schließt aber wieder darüber.
   Der Stop liegt knapp unter dem Tief dieser Kerze.
 - **SELL:** spiegelbildlich unter einem fallenden VWAP.
-- **Ziel:** 1,5-mal das Risiko. Stops unter 15 Punkten werden ausgelassen, die frisst der Spread.
+- **Ziel:** 2-mal das Risiko. Stops unter 15 Punkten werden ausgelassen, die frisst der Spread.
+- **Stop nachziehen:** Liegt der Trade 0,5R im Plus, kommt ein Push. Dann den Stop auf Einstand
+  (+0,1R) setzen und danach mit 0,5R Abstand nachziehen, am einfachsten als Trailing-Stop bei Capital.com.
+  So wird aus einem Trade, der erst steigt und dann dreht, ein kleiner Gewinn statt eines vollen Verlusts.
 - Signale kommen von 16:10 bis 21:05 Uhr deutscher Zeit, immer nur eine offene Position,
   höchstens 6 pro Tag. Nach 3 Verlusten ist für den Tag Pause. Glattgestellt wird bis 21:55 Uhr.
 - **Vor 16:10 Uhr gibt es keine Signale.** Auf dem Nasdaq-100-Future verlor der VWAP-Pullback in
@@ -106,10 +109,15 @@ Für den täglichen Handel im Nasdaq 100 gibt es ein eigenes Setup, den **VWAP-P
 
 Im Rückblick über 59 Handelstage, mit 2 Punkten Spread pro Trade:
 
-| | Trades/Tag | Ø pro Trade |
-| --- | --- | --- |
-| mit Trendfilter | 0,6 | +0,25 R |
-| ohne Trendfilter | 1,1 | +0,06 R |
+| | Trades/Tag | Treffer | Ø pro Trade | längste Verlustserie |
+| --- | --- | --- | --- |
+| mit Trendfilter, Stop nachziehen | 0,7 | 74 % | +0,29 R | 2 |
+| ohne Trendfilter, Stop nachziehen | 1,2 | 67 % | +0,23 R | 2 |
+| zum Vergleich: Stop bleibt, Ziel 1,5R, mit Trendfilter | 0,6 | 53 % | +0,25 R | 5 |
+
+Die Regel zum Nachziehen wurde auf der ersten Hälfte des Zeitraums gewählt und auf der zweiten
+geprüft: Die Trefferquote lag dort bei 68 % bzw. 82 %. Rund ein Drittel der Gewinner sind
+allerdings Mini-Gewinne: Der Kurs drehte, nachdem der Stop schon auf Einstand stand.
 
 Zum Vergleich lag der Opening-Range-Ausbruch des Capital.com-Bots über denselben Zeitraum bei −0,26 R.
 Beide VWAP-Varianten waren in der ersten Hälfte des Zeitraums bei null oder im Minus.

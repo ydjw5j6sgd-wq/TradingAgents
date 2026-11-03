@@ -157,3 +157,38 @@ def test_end_of_entries_uses_the_day_s_german_time():
     late = {"date": "2026-10-28", "bias": "long", "seen": 66, "open": None, "trades": []}
     # in the week Europe has left summer time and the US has not, entries end at 20:05
     assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28), True, 1.5, 15, 3)[1].startswith("20:05 Uhr")
+
+
+SIG = {"slot": 8, "side": "BUY", "entry": 100.0, "stop": 90.0, "target": 120.0, "risk": 10.0, "rr": 2.0}
+
+
+def test_follow_moves_the_stop_to_the_entry_at_half_r_then_trails():
+    s = {9: bar(100, 106, 99, 105), 10: bar(105, 112, 104, 111), 11: bar(111, 111, 106, 107)}
+    f = vs.follow(s, SIG, last_slot=9, be_at=0.5, trail=0.5)
+    assert f["result"] is None and f["moved"] and f["stop"] == pytest.approx(101)  # entry + 0.1 R = 101, and 106 - 5 = 101 behind the best price
+    f = vs.follow(s, SIG, last_slot=10, be_at=0.5, trail=0.5)
+    assert f["stop"] == pytest.approx(107)  # trails 5 behind the best price 112
+    f = vs.follow(s, SIG, last_slot=11, be_at=0.5, trail=0.5)
+    assert (f["result"], f["r"]) == ("trail", pytest.approx(0.7))
+
+
+def test_follow_without_the_move_is_the_plain_outcome():
+    s = {9: bar(100, 106, 99, 105), 10: bar(105, 106, 89, 95)}
+    assert vs.follow(s, SIG)["result"] == "stop" and vs.outcome(s, SIG)[:2] == ("stop", -1.0)
+    moved = vs.follow(s, SIG, be_at=0.5)
+    assert (moved["result"], moved["r"]) == ("trail", pytest.approx(0.1))
+
+
+def test_live_sends_one_move_push_then_closes_on_the_trailed_stop():
+    s = rising()
+    s[8] = bar(150, 185, 120, 182)
+    state = {"date": DAY.isoformat(), "bias": "long", "seen": None, "open": None, "trades": []}
+    assert ls.step(state, s, 8, DAY, True, 2.0, 15, 6)[0] == "SIGNAL"
+    risk = state["open"]["risk"]
+    s[9] = bar(182, 182 + 0.6 * risk, 181, 182 + 0.5 * risk)
+    kind, line = ls.step(state, s, 9, DAY, True, 2.0, 15, 6)
+    assert kind == "MOVE" and line.startswith("STOP NACHZIEHEN – BUY von 16:15 Uhr")
+    assert ls.step(state, s, 9, DAY, True, 2.0, 15, 6) is None
+    s[10] = bar(200, 201, 150, 160)
+    kind, line = ls.step(state, s, 10, DAY, True, 2.0, 15, 6)
+    assert kind == "CLOSED" and "nachgezogener Stop erreicht" in line and state["trades"][0]["r"] > 0

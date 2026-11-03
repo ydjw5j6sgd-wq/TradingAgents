@@ -5,11 +5,13 @@
 printing one line and keeping the day in trader/state/live_signals.json:
 
   SIGNAL   a complete bar gave a BUY or SELL: entry, stop, target, reward:risk
-  CLOSED   the open signal reached its stop or target, or the 15:55 flat-by
+  MOVE     the open signal is +0.5 R: move the stop to the entry and trail it
+  CLOSED   the open signal reached its stop, its trailed stop or its target,
+           or the 15:55 flat-by
   END      no more entries today (after 21:05 German time, max trades, 3 losses, closed day)
   WAIT     --max-minutes ran out with nothing new: just run it again
 
-Exit code 0 for SIGNAL, CLOSED and END, 3 for WAIT. A bar only counts once
+Exit code 0 for SIGNAL, MOVE, CLOSED and END, 3 for WAIT. A bar only counts once
 Yahoo's data reaches past its end, so a half-finished bar never signals. One
 signal is open at a time, at most --max-trades a day. Nothing is ever placed.
 
@@ -65,13 +67,24 @@ def signal_line(day, sig, bias):
     return (f"{word} NAS100 – Kerze bis {de_time(day, sig['slot'], end=True)} Uhr: Einstieg ~{num(sig['entry'])}, "
             f"Stop {num(sig['stop'])} (-{num(sig['risk'])} Pkt), "
             f"Ziel {num(sig['target'])} (+{num(sig['rr'] * sig['risk'])} Pkt), "
-            f"CRV {num(sig['rr'])} : 1. VWAP {num(sig['vwap'])}, Tagestrend {TRENDS[bias]}."
+            f"CRV {num(sig['rr'])} : 1. Bei +{num(vs.BE_AT * sig['risk'])} Pkt kommt der Push zum Nachziehen. "
+            f"VWAP {num(sig['vwap'])}, Tagestrend {TRENDS[bias]}."
             + (context_text(sig["context"]) if sig.get("context") else "")
             + " Index-Kurse: beim CFD Stop und Ziel als Abstand übernehmen. Nichts platziert.")
 
 
+def move_line(day, sig, stop):
+    ahead = abs(stop - sig["entry"])
+    return (f"STOP NACHZIEHEN – {sig['side']} von {de_time(day, sig['slot'], end=True)} Uhr war mindestens "
+            f"{num(vs.BE_AT * sig['risk'])} Pkt im Plus. Stop jetzt auf {num(stop)} ({num(ahead)} Pkt über dem "
+            f"Einstieg statt Verlust), dann mit {num(vs.TRAIL * sig['risk'])} Pkt Abstand nachziehen "
+            f"(Trailing-Stop {num(vs.TRAIL * sig['risk'])} Pkt). Ist der Kurs schon am neuen Stop, "
+            f"Position schließen. Ziel bleibt {num(sig['target'])}.")
+
+
 def closed_line(day, sig, result, r, slot):
-    what = {"stop": "STOP erreicht", "target": "ZIEL erreicht", "flat": "glattgestellt (21:55)"}[result]
+    what = {"stop": "STOP erreicht", "trail": "nachgezogener Stop erreicht", "target": "ZIEL erreicht",
+            "flat": "glattgestellt (21:55)"}[result]
     return (f"{sig['side']} von {de_time(day, sig['slot'], end=True)} Uhr: {what} in der Kerze bis "
             f"{de_time(day, slot, end=True)} Uhr, " + f"{r:+.2f}".replace(".", ",") + " R.")
 
@@ -100,12 +113,15 @@ def step(state, session, complete, day, trend_filter, rr, min_risk, max_trades, 
     """
     if state["open"]:
         sig = state["open"]
-        result, r, slot = vs.outcome(session, sig, last_slot=complete)
-        if result:
-            state["trades"].append({**sig, "result": result, "r": r})
+        f = vs.follow(session, sig, last_slot=complete, be_at=vs.BE_AT, trail=vs.TRAIL)
+        if f["result"]:
+            state["trades"].append({**sig, "result": f["result"], "r": f["r"]})
             state["open"] = None
-            state["seen"] = max(state["seen"] or -1, slot)
-            return "CLOSED", closed_line(day, sig, result, r, slot)
+            state["seen"] = max(state["seen"] or -1, f["slot"])
+            return "CLOSED", closed_line(day, sig, f["result"], f["r"], f["slot"])
+        if f["moved"] and not sig.get("moved"):
+            sig["moved"] = True
+            return "MOVE", move_line(day, sig, f["stop"])
         return None
     losses = sum(1 for t in state["trades"] if t["r"] < 0)
     if losses >= max_losses:
@@ -188,7 +204,7 @@ def main(argv=None):
     p.add_argument("command", choices=["next", "status"])
     p.add_argument("--no-trend-filter", dest="trend_filter", action="store_false",
                    help="signal both sides whatever the daily trend")
-    p.add_argument("--rr", type=float, default=1.5, help="target in R (default 1.5)")
+    p.add_argument("--rr", type=float, default=vs.TARGET_R, help="target in R (default 2)")
     p.add_argument("--min-risk", type=float, default=15.0, help="skip stops under this many points")
     p.add_argument("--max-trades", type=int, default=6, help="signals a day (default 6)")
     p.add_argument("--max-losses", type=int, default=3, help="pause for the day after this many losses")
