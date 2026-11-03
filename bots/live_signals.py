@@ -28,8 +28,8 @@ Nothing is ever placed.
 
   python3 bots/live_signals.py next                               # both directions (default)
   python3 bots/live_signals.py next --trend-filter                # only the daily trend's side
-  python3 bots/live_signals.py next --blackout 14:30 --blackout 20:00
-  python3 bots/live_signals.py next --account 2000 --risk-pct 1 --eur-per-point 0.86
+  python3 bots/live_signals.py next --blackout 16:00 --stop-at 19:45      # ISM at 16:00, FOMC evening
+  python3 bots/live_signals.py next --account 2000 --risk-pct 0.5 --eur-per-point 0.86
   python3 bots/live_signals.py status
 """
 
@@ -57,13 +57,16 @@ RULES = {
     "rr": vs.TARGET_R,        # the order's target (TP2) in R
     "min_risk": 15.0,         # skip stops under this many points: the spread would eat them
     "min_score": vs.MIN_SCORE,
-    "max_trades": 6,
+    "max_trades": 4,          # never reached in the replay; a cap for the odd overtrading day
     "pause_after": 2,         # losses in a row
     "pause_minutes": 60,
-    "risk_pct": 1.0,          # account risk per trade (rulebook: 0.5 to 1)
+    "risk_pct": 0.5,          # account risk per trade: 0.5 % leaves room for 4 losses before -2 %
     "day_loss_pct": 2.0,      # rulebook: stop for the day at -2% of the account
     "blackouts": [],          # German clock times of news, "HH:MM"
     "blackout_minutes": 15,
+    "stop_at": None,          # German clock time after which no new signals come (FOMC days: 19:45)
+    "fomo_bar": True,         # -15 for a big impulse bar (helps in the full replay)
+    "cluster_room": False,    # penalise a volume cluster less than 1 R away in the trade's direction
     "account": None,          # account in EUR, for the position size
     "eur_per_point": None,    # EUR per index point for size 1 of the CFD
 }
@@ -272,6 +275,8 @@ def step(state, session, complete, day, rules=None, history=None, minutes=None):
                          "Uhr, keine neuen Signale. Nicht nachlegen.")
     if len(trades) >= rules["max_trades"]:
         return "END", f"{rules['max_trades']} Signale heute erreicht. Für heute keine weiteren."
+    if rules["stop_at"] and de_time(day, complete, end=True) >= rules["stop_at"]:
+        return "END", f"Ab {rules['stop_at']} Uhr keine neuen Trades heute (Nachrichten)."
     if complete > vs.LAST_ENTRY_SLOT:
         return "END", (f"{de_time(day, vs.LAST_ENTRY_SLOT, end=True)} Uhr vorbei: "
                        "keine neuen Einstiege mehr heute.")
@@ -300,9 +305,10 @@ def step(state, session, complete, day, rules=None, history=None, minutes=None):
             recent = [history[d] for d in sorted(history)[-3:]]
             today = {j: b for j, b in session.items() if j <= k}
             sig["clusters"] = vs.nearest_clusters(vs.volume_levels(recent + [today]), sig["entry"])
-        sig["fomo"] = vs.impulsive(session, sig)
+        sig["fomo"] = rules["fomo_bar"] and vs.impulsive(session, sig)
+        tight = rules["cluster_room"] and vs.cramped(sig, sig.get("clusters"))
         sig["score"] = vs.setup_score(sig.get("trends", {}), sig["side"],
-                                      sig.get("context", {}).get("quality"), state["bias"], sig["fomo"])
+                                      sig.get("context", {}).get("quality"), state["bias"], sig["fomo"], tight)
         if sig["score"] < rules["min_score"]:
             state["skipped"].append({"slot": k, "side": sig["side"], "why": f"Score {sig['score']}"})
             continue
@@ -374,11 +380,12 @@ def main(argv=None):
     p.add_argument("--account", type=float, help="account in EUR, for the position size")
     p.add_argument("--eur-per-point", type=float, help="EUR per index point for size 1 of the CFD")
     p.add_argument("--blackout", action="append", default=[], help="news time HH:MM (German), repeatable")
+    p.add_argument("--stop-at", help="no new signals from this German time HH:MM (FOMC days: 19:45)")
     p.add_argument("--max-minutes", type=float, default=100, help="return WAIT after this long")
     args = p.parse_args(argv)
     rules = {**RULES, "trend_filter": args.trend_filter, "min_score": args.min_score,
              "risk_pct": args.risk_pct, "account": args.account, "eur_per_point": args.eur_per_point,
-             "blackouts": args.blackout}
+             "blackouts": args.blackout, "stop_at": args.stop_at}
     return {"next": cmd_next, "status": cmd_status}[args.command](args, rules)
 
 

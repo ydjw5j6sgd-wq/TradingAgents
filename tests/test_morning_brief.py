@@ -31,7 +31,7 @@ def test_raised_stress_halves_the_size():
 def test_plan_times_in_german_time_and_points():
     p = mb.plan(datetime.date(2026, 11, 3), 20.0)
     assert (p["open_de"], p["first_signal_de"], p["last_signal_de"], p["flat_de"]) == (
-        "15:30", "16:10", "21:05", "21:55")
+        "15:30", "16:10", "21:00", "21:55")
     assert (p["target_pts"], p["size_per_10_eur"]) == (40.0, 0.5)
     # the weeks when only Europe has left summer time: the US opens at 14:30 German time
     assert mb.plan(datetime.date(2026, 10, 27), 20.0)["open_de"] == "14:30"

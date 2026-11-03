@@ -38,7 +38,7 @@ SKILLS = ROOT / ".claude" / "skills"
 NY = ZoneInfo("America/New_York")
 
 FIRST_SLOT = 7      # 10:05 New York
-LAST_ENTRY_SLOT = 66  # 15:00 New York
+LAST_ENTRY_SLOT = 65  # the 14:55 bar, closing at 15:00 New York (21:00 in Germany)
 FLAT_SLOT = 76      # the 15:50 bar closes at the 15:55 flat-by
 LOOK = 6            # VWAP slope over six bars (30 minutes)
 TARGET_R = 2.0      # target in R
@@ -406,6 +406,8 @@ def fetch_minutes(day):
 
 TIMEFRAMES = {"4H": 48, "2H": 24, "1H": 12, "15M": 3, "5M": 1}   # in 5-minute bars
 WEIGHTS = {"4H": 10, "2H": 8, "1H": 8, "15M": 6, "5M": 4}       # the higher timeframe counts more
+# Scoring only 4H, 1H and 15M, or dropping the FOMO penalty, did worse in the full replay
+# (+0.41 and +0.46 R a trade against +0.53 R), although each looked useless on its own.
 MIN_SCORE = 40       # below this the replay lost money: NO TRADE
 IMPULSE = 2.0        # a signal bar this many times the last hour's average range is a FOMO bar
 
@@ -423,9 +425,11 @@ def impulsive(session, sig, look=12):
     return bool(prev and bar) and (bar["h"] - bar["l"]) >= IMPULSE * sum(prev) / len(prev)
 
 
-def setup_score(trends, side, quality, bias, fomo=False):
+def setup_score(trends, side, quality, bias, fomo=False, cramped=False):
     """0-100: 50, plus or minus each timeframe's weight as it agrees with or opposes the signal,
-    +10/+5 for a calm/medium volume grade, +-8 with or against the daily trend, -15 for a FOMO bar."""
+    +10/+5 for a calm/medium volume grade, +-8 with or against the daily trend, -15 for a FOMO
+    bar, and -15 when cramped: a volume cluster less than 1 R away in the trade's direction
+    (off by default: it did worse in the replay, +0.49 against +0.53 R)."""
     want = "long" if side == "BUY" else "short"
     score = 50
     for name, weight in WEIGHTS.items():
@@ -434,4 +438,12 @@ def setup_score(trends, side, quality, bias, fomo=False):
     score += {"hoch": 10, "mittel": 5}.get(quality, 0)
     score += 0 if bias == "neutral" else 8 if bias == want else -8
     score -= 15 if fomo else 0
+    score -= 15 if cramped else 0
     return max(0, min(100, score))
+
+
+def cramped(sig, clusters):
+    """Whether the nearest volume cluster in the trade's direction is less than 1 R away."""
+    above, below = clusters or (None, None)
+    level = above if sig["side"] == "BUY" else below
+    return level is not None and abs(level - sig["entry"]) < sig["risk"]

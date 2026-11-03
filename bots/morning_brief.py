@@ -250,7 +250,8 @@ def german(b):
         "",
         "Plan: VWAP-Pullback und Fehlausbruch, beide Richtungen",
         f"- US-Börse ab {pl['open_de']} Uhr, Signale von {pl['first_signal_de']} bis {pl['last_signal_de']} Uhr, "
-        f"glattstellen bis {pl['flat_de']} Uhr, max. 6 Signale, Pause nach 3 Verlusten",
+        f"glattstellen bis {pl['flat_de']} Uhr, max. 4 Trades, Pause nach 2 Verlusten in Folge, "
+        "Tageslimit -2 % (bei 0,5 % Risiko pro Trade)",
         f"- Typischer Stop ~{num(pl['stop_pts'], 0)} Punkte, Ziel ~{num(pl['target_pts'], 0)} Punkte, "
         f"CRV {num(pl['rr'])} : 1",
         f"- Bei +{num(vs.BE_AT * pl['stop_pts'], 0)} Punkten Stop auf Einstand, dann mit "

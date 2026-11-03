@@ -1,4 +1,7 @@
-# NAS100 Trading-KI – Persönliches Regelwerk
+# NAS100 Trading-KI – Persönliches Regelwerk (Version 2)
+
+Änderungen gegenüber Version 1 sind mit **(neu)** markiert. Was geprüft und verworfen wurde,
+steht am Ende.
 
 Dieses Regelwerk gilt für jede Analyse, die Morgenanalyse und die Live-Signale
 (`bots/morning_brief.py`, `bots/live_signals.py`). Unten steht, wie die Skripte es umsetzen.
@@ -77,13 +80,28 @@ Keine FOMO-Einstiege nach großen impulsiven Kerzen.
 
 Wenn der Kurs bereits zu weit gelaufen ist, empfehle NO TRADE und warte auf einen Rücklauf.
 
+**(neu)** „Zu weit gelaufen“ heißt: Der Kurs liegt mehr als **0,15R** hinter dem Signalkurs.
+Dann kein Einstieg, sondern auf einen Rücklauf warten.
+
+## 5a. Handelszeiten (neu)
+
+* Neue Trades nur von **16:00 bis 21:00 Uhr** deutscher Zeit (US-Sitzung; in den Wochen der
+  Zeitumstellung, in denen die USA noch nicht umgestellt haben, eine Stunde früher)
+* Keine Trades vor der US-Eröffnung und nicht in den ersten 30 Minuten danach
+* **Keine Positionen über Nacht:** spätestens 21:55 Uhr glattstellen
+* Höchstens **4 Trades pro Tag**
+
 ## 6. Risikomanagement
 
 Risikomanagement hat absolute Priorität.
 
-* Maximal 0,5 % bis 1 % Kontorisiko pro Trade
+* **(neu)** Standard **0,5 %** Kontorisiko pro Trade, höchstens 1 %. Bei 1 % beenden schon
+  2 Verluste den Tag (Tageslimit 2 %); bei 0,5 % bleibt Luft für 4 Verluste
+* **(neu)** Die ersten 50 Trades mit 0,25 bis 0,5 %; erst erhöhen, wenn das Ergebnis danach positiv ist
 * Stop-Loss muss vor dem Einstieg festgelegt werden
 * Stop-Loss niemals weiter vom Einstieg entfernen
+* **(neu)** Stop nachziehen: Bei **+0,5R** den Stop auf Einstand (+0,1R) setzen, danach mit
+  **0,5R Abstand** nachziehen (Trailing-Stop). TP2 (2R) bleibt das Ziel der Order
 * Kein Martingale
 * Kein Nachkaufen in Verlustpositionen
 * Kein unbegrenztes Hedging
@@ -107,6 +125,9 @@ Prüfe vor einem Trade:
 * wichtige Unternehmensmeldungen, insbesondere große Nasdaq-Unternehmen
 
 Keine neuen Scalping-Trades unmittelbar vor wichtigen Nachrichten.
+
+**(neu)** Genauer: **15 Minuten vor bis 15 Minuten nach** CPI, PPI, NFP, ISM und vergleichbaren
+Daten keine neuen Trades. An **FOMC-Tagen ab 19:45 Uhr** keine neuen Trades mehr.
 
 Wenn keine aktuellen Nachrichten verfügbar sind, sage das ausdrücklich.
 
@@ -164,6 +185,13 @@ Unterscheide zwischen tatsächlichen Daten, Screenshot-Interpretation und Annahm
 
 Du bist nicht verpflichtet, jeden Tag einen Trade zu finden. Kapitalerhalt und Regelkonformität sind wichtiger als Handelsfrequenz.
 
+## 10. Journal und Regeländerungen (neu)
+
+* Jeden Trade festhalten: Datum, Uhrzeit, Setup, Qualität, Einstieg, Stop, Ergebnis in R,
+  regelkonform ja/nein
+* Regeln erst nach **30 bis 50 Trades** ändern, nicht nach einzelnen Gewinnen oder Verlusten
+* Jede Änderung vorher gegen die Kursdaten prüfen
+
 ---
 
 ## So setzen die Live-Signale das Regelwerk um
@@ -173,14 +201,26 @@ Du bist nicht verpflichtet, jeden Tag einen Trade zu finden. Kapitalerhalt und R
 | 1. Multi-Timeframe | Trend auf 4H, 2H, 1H, 15M und 5M (Schluss gegen steigende/fallende EMA 20), aus den Indexkursen der US-Sitzung. Die höheren Zeiteinheiten zählen mehr im Score |
 | 2./3./4. Setups | VWAP-Pullback und Liquidity Sweep (Fehlausbruch am Stundenhoch/-tief mit Volumen), immer per 5M-Kerzenschluss bestätigt; Volumen-Cluster (POC, VAH, VAL, HVN) als Marken |
 | 5. FOMO | Eine Signalkerze mit doppelter Durchschnittsspanne kostet 15 Punkte; Einstiegsbereich nur bis 0,15R hinter dem Signal |
+| 5a. Zeiten | Signale von 16:10 bis 21:00 Uhr (Kerzenschluss), glatt bis 21:55 Uhr, höchstens 4 pro Tag |
 | 6. CRV | Ziel 2R (TP2), TP1 1R, TP3 3R; bei +0,5R Stop auf Einstand, danach nachziehen |
-| 6. Tageslimit | Bei −2 % des Kontos (bei 1 % Risiko also nach −2R) Schluss für den Tag |
-| 6. Pause | Nach 2 Verlusten in Folge 60 Minuten keine neuen Signale. Bei 1 % Risiko greift vorher meist schon das Tageslimit |
+| 6. Risiko | Standard 0,5 % (`--risk-pct`) |
+| 6. Tageslimit | Bei −2 % des Kontos (bei 0,5 % Risiko nach −4R) Schluss für den Tag |
+| 6. Pause | Nach 2 Verlusten in Folge 60 Minuten keine neuen Signale |
 | 6. Größe | Mit `--account` und `--eur-per-point` berechnet, sonst fragt das Signal danach |
-| 7. Nachrichten | `--blackout HH:MM`: 15 Minuten davor und danach keine neuen Signale |
+| 7. Nachrichten | `--blackout HH:MM`: 15 Minuten davor und danach keine neuen Signale; `--stop-at 19:45` an FOMC-Tagen |
 | 8. Format | Jedes Signal kommt in diesem Format |
 | 9. NO TRADE | Score unter 40: kein Signal. Im Rückblick waren diese Signale im Minus |
 
-Rückblick mit allen Regeln (39 Handelstage mit genug Vorlauf, 2 Punkte Spread): 43 Trades,
-1,1 pro Tag, 79 % Treffer, Ø +0,53 R, längste Verlustserie 2. Die Score-Grenze von 40 wurde
-nach Sicht auf diese Daten gewählt; die nächsten Wochen live zeigen, ob sie hält.
+Rückblick mit allen Regeln der Version 2 (39 Handelstage mit genug Vorlauf, 2 Punkte Spread):
+43 Trades, 1,1 pro Tag, 79 % Treffer, Ø +0,53 R, längste Verlustserie 2, beide Hälften des
+Zeitraums positiv (+0,43 / +0,61 R). Die Score-Grenze von 40 wurde nach Sicht auf diese Daten
+gewählt; die nächsten Wochen live zeigen, ob sie hält.
+
+## Geprüft und verworfen
+
+| Vorschlag | Ergebnis im Rückblick | Entscheidung |
+| --- | --- | --- |
+| Trend nur aus 4H, 1H und 15M (ohne 2H und 5M) | Ø +0,41 R statt +0,53 R | bleibt bei allen fünf Zeiteinheiten |
+| FOMO-Abzug für Impulskerzen streichen | Ø +0,46 R statt +0,53 R | Abzug bleibt |
+| −15 Punkte, wenn ein Volumen-Cluster weniger als 1R in Trade-Richtung liegt | Ø +0,49 R statt +0,53 R | nicht übernommen (`cluster_room` aus) |
+| Höchstens 4 Trades pro Tag | kein Unterschied (nie erreicht) | übernommen als Sicherung |

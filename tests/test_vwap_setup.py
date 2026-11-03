@@ -127,9 +127,9 @@ def test_the_daily_loss_limit_follows_the_risk_per_trade():
     s = pullback_day()
     trades = [{"r": -1.0, "closed_slot": 2}, {"r": 0.3, "closed_slot": 4}, {"r": -1.0, "closed_slot": 6},
               {"r": -0.4, "closed_slot": 7}]
-    kind, line = ls.step(fresh(seen=7, trades=trades), s, 8, DAY, ANY)  # -2.1 R at 1 % = -2.1 %
+    kind, line = ls.step(fresh(seen=7, trades=trades), s, 8, DAY, {**ANY, "risk_pct": 1.0})  # -2.1 %
     assert kind == "END" and line.startswith("Tagesverlustlimit erreicht")
-    half = {**ANY, "risk_pct": 0.5, "pause_after": 9}  # -2.1 R at 0.5 % = -1.05 %: trading on
+    half = {**ANY, "pause_after": 9, "max_trades": 9}  # the default 0.5 %: -2.1 R = -1.05 %, trading on
     assert ls.step(fresh(seen=7, trades=trades), s, 8, DAY, half)[0] == "SIGNAL"
 
 
@@ -204,8 +204,15 @@ def test_signal_line_follows_the_rulebook_format():
 
 def test_end_of_entries_uses_the_day_s_german_time():
     late = {"date": "2026-10-28", "bias": "long", "seen": 66, "open": None, "trades": []}
-    # in the week Europe has left summer time and the US has not, entries end at 20:05
-    assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28))[1].startswith("20:05 Uhr")
+    # in the week Europe has left summer time and the US has not, entries end at 20:00
+    assert ls.step(late, rising(), 67, datetime.date(2026, 10, 28))[1].startswith("20:00 Uhr")
+
+
+def test_stop_at_ends_new_signals_on_a_news_evening():
+    s = pullback_day()
+    kind, line = ls.step(fresh(), s, 8, DAY, {**ANY, "stop_at": "16:00"})
+    assert kind == "END" and line.startswith("Ab 16:00 Uhr keine neuen Trades")
+    assert ls.step(fresh(), s, 8, DAY, {**ANY, "stop_at": "19:45"})[0] == "SIGNAL"
 
 
 SIG = {"slot": 8, "side": "BUY", "entry": 100.0, "stop": 90.0, "target": 120.0, "risk": 10.0, "rr": 2.0}
