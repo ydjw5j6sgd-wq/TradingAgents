@@ -1,0 +1,449 @@
+"""The NAS100 day-trading setup: a pullback to the session VWAP in the direction it slopes.
+
+A session is {slot: bar}, slot 0 being the 9:30 New York bar, each bar a dict
+with o, h, l, c and v (5-minute bars). The rule, on a COMPLETE bar k:
+
+- BUY: the VWAP rises (above its value six bars earlier), the bar before
+  closed above the VWAP, and bar k dips to the VWAP (low at or under it) but
+  closes back above it. Stop a tenth of the bar's range under its low.
+- SELL: the mirror image under a falling VWAP.
+- Target: twice the risk. At +0.5 R the stop moves to the entry (plus a
+  tenth of the risk) and then trails half the risk behind the best price,
+  the way a discretionary trader locks in a winner. Stops under min_risk
+  points are skipped: the spread would eat them. Chosen on the first half
+  of the replay and checked on the second: the trailing stop raised the
+  hit rate from 53% to 74% and cut the longest losing streak from 5 to 2.
+- Signals on the bars from 10:05 to 15:00 New York, so from 16:10 to 21:05
+  German time when they close; one position at a time, at most max_trades
+  a day (6), a pause for the day after 3 losses, flat by 15:55 New York
+  (21:55 in Germany).
+
+With the trend filter a day takes only the side of the daily trend (rising
+or falling 20-day average); a neutral day takes both.
+
+Each signal also carries context: the 15- and 45-minute trend and the
+volume against the usual for that time of day. Replayed as filters the
+higher timeframes did not help; calm volume did a little better, so it
+grades a signal's quality instead of dropping signals.
+"""
+
+import datetime
+import importlib.util
+import json
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parent.parent
+SKILLS = ROOT / ".claude" / "skills"
+NY = ZoneInfo("America/New_York")
+
+FIRST_SLOT = 7      # 10:05 New York
+LAST_ENTRY_SLOT = 65  # the 14:55 bar, closing at 15:00 New York (21:00 in Germany)
+FLAT_SLOT = 76      # the 15:50 bar closes at the 15:55 flat-by
+LOOK = 6            # VWAP slope over six bars (30 minutes)
+TARGET_R = 2.0      # target in R
+BE_AT = 0.5         # at +0.5 R the stop moves to the entry (plus 0.1 R)
+TRAIL = 0.5         # and then trails 0.5 R behind the best price
+SWEEP_LOOK = 12     # a sweep runs the high or low of the last hour (12 bars)
+SWEEP_VOLUME = 1.2  # on at least 1.2 times the usual volume for that time of day
+SETUPS = ("vwap", "sweep")
+SETUP_NAMES = {"vwap": "VWAP-Pullback", "sweep": "Fehlausbruch"}
+SIDE_OF_BIAS = {"long": {"BUY"}, "short": {"SELL"}, "neutral": {"BUY", "SELL"}}
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+orb = _load("capital_orb", ROOT / "bots" / "capital_orb.py")
+
+
+def session_vwap(session):
+    """{slot: VWAP} from the open, on the bars' typical price."""
+    pv = vol = 0.0
+    out = {}
+    for k in sorted(session):
+        b = session[k]
+        v = b.get("v") or 1
+        pv += (b["h"] + b["l"] + b["c"]) / 3 * v
+        vol += v
+        out[k] = pv / vol
+    return out
+
+
+def pullback(session, k, vw=None, rr=1.5, min_risk=15.0):
+    """The signal on bar k, or None."""
+    vw = vw or session_vwap(session)
+    b, p = session.get(k), session.get(k - 1)
+    if b is None or p is None or k - 1 not in vw or k - LOOK not in vw:
+        return None
+    span = b["h"] - b["l"]
+    if vw[k] > vw[k - LOOK] and p["c"] > vw[k - 1] and b["l"] <= vw[k] < b["c"]:
+        side, stop = "BUY", b["l"] - 0.1 * span
+    elif vw[k] < vw[k - LOOK] and p["c"] < vw[k - 1] and b["h"] >= vw[k] > b["c"]:
+        side, stop = "SELL", b["h"] + 0.1 * span
+    else:
+        return None
+    risk = abs(b["c"] - stop)
+    if risk < min_risk:
+        return None
+    target = b["c"] + rr * risk if side == "BUY" else b["c"] - rr * risk
+    return {"slot": k, "side": side, "entry": b["c"], "stop": stop, "target": target,
+            "risk": risk, "rr": rr, "vwap": vw[k], "setup": "vwap"}
+
+
+def sweep(session, k, history, rr=2.0, min_risk=15.0, look=SWEEP_LOOK, vol_x=SWEEP_VOLUME):
+    """A failed breakout on bar k, or None: the bar runs the last hour's high (low) on
+    heavy volume but closes back under (over) it and against its open, so the buyers
+    (sellers) who chased the break are trapped. SELL (BUY), stop beyond the bar."""
+    b = session.get(k)
+    prev = [session[j] for j in range(k - look, k) if j in session]
+    if b is None or len(prev) < look or not history:
+        return None
+    rv = relative_volume(history, session, k)
+    if rv is None or rv < vol_x:
+        return None
+    hi, lo = max(x["h"] for x in prev), min(x["l"] for x in prev)
+    span = b["h"] - b["l"]
+    if b["h"] > hi and b["c"] < hi and b["c"] < b["o"]:
+        side, stop, level = "SELL", b["h"] + 0.1 * span, hi
+    elif b["l"] < lo and b["c"] > lo and b["c"] > b["o"]:
+        side, stop, level = "BUY", b["l"] - 0.1 * span, lo
+    else:
+        return None
+    risk = abs(b["c"] - stop)
+    if risk < min_risk:
+        return None
+    target = b["c"] + rr * risk if side == "BUY" else b["c"] - rr * risk
+    return {"slot": k, "side": side, "entry": b["c"], "stop": stop, "target": target, "risk": risk,
+            "rr": rr, "level": level, "volume": rv, "setup": "sweep"}
+
+
+def signal_at(session, k, vw, history, setups=SETUPS, rr=2.0, min_risk=15.0):
+    """The first setup that fires on bar k: the VWAP pullback before the sweep."""
+    sig = pullback(session, k, vw, rr, min_risk) if "vwap" in setups else None
+    if sig is None and "sweep" in setups:
+        sig = sweep(session, k, history, rr, min_risk)
+    return sig
+
+
+def walk(bars, sig, be_at=None, trail=None):
+    """Follow a signal over bars after its entry: an iterable of (key, bar) in time order.
+
+    be_at: once the best price is be_at R in profit, the stop moves to the
+    entry plus a tenth of the risk; trail: from then on it follows the best
+    price trail R behind. The stop is checked before the target, and a bar
+    only moves the stop for the bars after it. Returns a dict with result
+    ("stop", "trail" for a moved stop, "target", or None while open), r,
+    key, the current stop, whether it has moved, and the last (key, close).
+    """
+    long = sig["side"] == "BUY"
+    entry, risk = sig["entry"], sig["risk"]
+    stop, best, moved, last = sig["stop"], entry, False, None
+    for key, b in bars:
+        if (long and b["l"] <= stop) or (not long and b["h"] >= stop):
+            r = (stop - entry) / risk if long else (entry - stop) / risk
+            return {"result": "trail" if moved else "stop", "r": r if moved else -1.0, "key": key,
+                    "stop": stop, "moved": moved, "last": last}
+        if (long and b["h"] >= sig["target"]) or (not long and b["l"] <= sig["target"]):
+            return {"result": "target", "r": sig["rr"], "key": key, "stop": stop, "moved": moved, "last": last}
+        best = max(best, b["h"]) if long else min(best, b["l"])
+        gain = (best - entry) / risk if long else (entry - best) / risk
+        if be_at is not None and not moved and gain >= be_at:
+            moved = True
+            stop = entry + 0.1 * risk if long else entry - 0.1 * risk
+        if moved and trail is not None:
+            stop = max(stop, best - trail * risk) if long else min(stop, best + trail * risk)
+        last = (key, b["c"])
+    return {"result": None, "r": None, "key": None, "stop": stop, "moved": moved, "last": last}
+
+
+def follow(session, sig, last_slot=FLAT_SLOT, be_at=None, trail=None, flat=True):
+    """walk() over a session's 5-minute bars up to last_slot, closing at the flat-by bar.
+    Returns the walk's dict with the bar's slot as "slot"."""
+    bars = ((k, session[k]) for k in range(sig["slot"] + 1, min(last_slot, FLAT_SLOT) + 1) if k in session)
+    f = walk(bars, sig, be_at, trail)
+    if f["result"] is None and flat and last_slot >= FLAT_SLOT and f["last"]:
+        k, close = f["last"]
+        move = close - sig["entry"] if sig["side"] == "BUY" else sig["entry"] - close
+        f.update(result="flat", r=move / sig["risk"], key=k)
+    f["slot"] = f["key"]
+    return f
+
+
+def outcome(session, sig, last_slot=FLAT_SLOT, flat=True):
+    """(result, r, slot) with the stop left where it is, or (None, None, None) while open."""
+    f = follow(session, sig, last_slot, flat=flat)
+    return f["result"], f["r"], f["slot"]
+
+
+def scan_session(session, bias="neutral", trend_filter=False, rr=TARGET_R, min_risk=15.0, max_trades=6,
+                 max_losses=3, be_at=BE_AT, trail=TRAIL, history=None, setups=SETUPS):
+    """Every trade the rules take in one full session, one at a time, pausing after max_losses.
+    The sweep needs history (earlier sessions) for its volume check."""
+    vw = session_vwap(session)
+    sides = SIDE_OF_BIAS[bias] if trend_filter else SIDE_OF_BIAS["neutral"]
+    trades, busy = [], -1
+    for k in range(FIRST_SLOT, LAST_ENTRY_SLOT + 1):
+        if k <= busy or len(trades) >= max_trades or sum(t["r"] < 0 for t in trades) >= max_losses:
+            continue
+        sig = signal_at(session, k, vw, history, setups, rr, min_risk)
+        if sig is None or sig["side"] not in sides:
+            continue
+        f = follow(session, sig, be_at=be_at, trail=trail)
+        if f["result"] is None:
+            continue
+        trades.append({**sig, "result": f["result"], "r": f["r"]})
+        busy = f["slot"]
+    return trades
+
+
+def bias_by_date(dates, yearly):
+    """Each date's trend bias from the 30 daily bars before it."""
+    out = {}
+    for d in dates:
+        prior = [b for b in yearly if b["date"] < d][-30:]
+        out[d] = orb.market_regime(prior)["bias"] if len(prior) >= 26 else "neutral"
+    return out
+
+
+def backtest(days, biases, trend_filter=False, rr=TARGET_R, min_risk=15.0, max_trades=6, cost=2.0,
+             be_at=BE_AT, trail=TRAIL, setups=SETUPS):
+    """Stats over full sessions; each trade's R net of cost points."""
+    rs, risks, per_side = [], [], {"BUY": [], "SELL": []}
+    sessions = 0
+    order = sorted(days)
+    for i, d in enumerate(order):
+        if len(days[d]) < 70:
+            continue
+        sessions += 1
+        history = {x: days[x] for x in order[max(0, i - 20):i]}
+        for t in scan_session(days[d], biases.get(d, "neutral"), trend_filter, rr, min_risk, max_trades,
+                              be_at=be_at, trail=trail, history=history, setups=setups):
+            r = t["r"] - cost / t["risk"]
+            rs.append(r)
+            risks.append(t["risk"])
+            per_side[t["side"]].append(r)
+    avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else None
+    streak = worst = 0
+    for r in rs:
+        streak = streak + 1 if r < 0 else 0
+        worst = max(worst, streak)
+    risks.sort()
+    return {"sessions": sessions, "trades": len(rs), "per_day": round(len(rs) / sessions, 1) if sessions else 0,
+            "win_rate": round(sum(r > 0 for r in rs) / len(rs), 2) if rs else None,
+            "avg_r": avg(rs), "total_r": round(sum(rs), 1), "worst_streak": worst,
+            "median_risk": risks[len(risks) // 2] if risks else None,
+            "buy_avg_r": avg(per_side["BUY"]), "sell_avg_r": avg(per_side["SELL"]),
+            "buys": len(per_side["BUY"]), "sells": len(per_side["SELL"])}
+
+
+# ---------------------------------------------------------------- data
+
+def tools():
+    return (_load("timemachine", SKILLS / "trader-timemachine" / "timemachine.py"),
+            _load("entry", SKILLS / "trader-entry" / "entry.py"))
+
+
+def fetch_60d(now_utc):
+    """{date: {slot: bar}} for about 60 sessions of ^NDX."""
+    tm, _ = tools()
+    result = tm.chart_result(tm.fetch_chart("^NDX"), "^NDX")
+    _, bars, _ = tm.parse_bars(result, now_utc.replace(tzinfo=None))
+    return {d: {s: {**b, "v": b.get("v") or 0} for s, b in sess.items()}
+            for d, sess in tm.split_sessions(bars).items()}
+
+
+def fetch_yearly():
+    """A year of ^NDX daily bars, oldest first."""
+    tm, _ = tools()
+    raw = json.loads(tm._get("https://query2.finance.yahoo.com/v8/finance/chart/%5ENDX?range=1y&interval=1d"))
+    res = raw["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    out = []
+    for i, t in enumerate(res["timestamp"]):
+        if None in (q["high"][i], q["low"][i], q["close"][i]):
+            continue
+        out.append({"date": datetime.datetime.fromtimestamp(t, NY).date().isoformat(),
+                    "high": q["high"][i], "low": q["low"][i], "close": q["close"][i]})
+    return out
+
+
+def fetch_today(day):
+    """(session {slot: bar}, data time as epoch seconds) for today's ^NDX 5-minute bars."""
+    _, entry = tools()
+    ch = entry.get_chart("^NDX", "5m")
+    open_ts = datetime.datetime.combine(day, datetime.time(9, 30), tzinfo=NY).timestamp()
+    session = {}
+    for b in ch["bars"]:
+        slot, rem = divmod(b["t"] - open_ts, 300)
+        if rem == 0 and 0 <= slot <= 77:
+            session[int(slot)] = {"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"],
+                                  "v": b.get("v") or 0}
+    return session, ch["data_time"]
+
+
+# ---------------------------------------------------------------- context: higher timeframes and volume
+
+def higher_bars(sessions, n, upto=None):
+    """Closes of n x 5-minute bars, aligned to 9:30, over sessions (oldest first).
+
+    upto=(date, slot) keeps only the bars complete by that 5-minute slot's close.
+    """
+    closes = []
+    for d in sorted(sessions):
+        s = sessions[d]
+        for start in range(0, 78, n):
+            last = start + n - 1
+            if upto and (d > upto[0] or (d == upto[0] and last > upto[1])):
+                return closes
+            if all(k in s for k in range(start, start + n)):
+                closes.append(s[last]["c"])
+    return closes
+
+
+def trend_of(closes, n=20):
+    """long, short or neutral: the last close against a rising or falling EMA."""
+    if len(closes) < n + 3:
+        return "neutral"
+    e, line = None, []
+    for c in closes:
+        e = c if e is None else e + 2 / (n + 1) * (c - e)
+        line.append(e)
+    if closes[-1] > line[-1] and line[-1] > line[-4]:
+        return "long"
+    if closes[-1] < line[-1] and line[-1] < line[-4]:
+        return "short"
+    return "neutral"
+
+
+def relative_volume(history, session, slot, days=20):
+    """A bar's volume against the same slot's average over the last days sessions."""
+    same = [s[slot].get("v") or 0 for s in [history[d] for d in sorted(history)][-days:] if slot in s]
+    avg = sum(same) / len(same) if same else 0
+    return (session[slot].get("v") or 0) / avg if avg and slot in session else None
+
+
+def opening_volume(history, session, bars=6, days=20):
+    """The first half hour's volume against its average over the last days sessions."""
+    first = lambda s: sum(s[k].get("v") or 0 for k in range(bars) if k in s)
+    prior = [first(history[d]) for d in sorted(history)[-days:]]
+    avg = sum(prior) / len(prior) if prior else 0
+    return first(session) / avg if avg and all(k in session for k in range(bars)) else None
+
+
+def signal_context(history, day, session, sig):
+    """15- and 45-minute trend, relative volume and a quality grade for a signal.
+
+    Quality is from the replay: signals on a calm bar (volume under the usual
+    for that time) and on a calm open did better. It grades, it does not filter.
+    """
+    sessions = {**history, day: session}
+    upto = (day, sig["slot"])
+    t15 = trend_of(higher_bars(sessions, 3, upto))
+    t45 = trend_of(higher_bars(sessions, 9, upto))
+    rv = relative_volume(history, session, sig["slot"])
+    ov = opening_volume(history, session)
+    calm = sum(1 for x in (rv, ov) if x is not None and x < 1.0)
+    quality = "hoch" if calm == 2 else "mittel" if calm == 1 else "normal"
+    return {"trend_15m": t15, "trend_45m": t45, "rel_volume": rv, "open_volume": ov, "quality": quality}
+
+
+def volume_levels(sessions, step=10, share=0.7, nodes=3, gap=50):
+    """Volume profile over sessions: point of control, value area (share of the volume
+    around it) and the strongest clusters (high-volume nodes, at least gap points
+    apart), in step-point bins."""
+    profile = {}
+    for sess in sessions:
+        for b in sess.values():
+            level = round((b["h"] + b["l"] + b["c"]) / 3 / step) * step
+            profile[level] = profile.get(level, 0) + (b.get("v") or 0)
+    if not profile or not sum(profile.values()):
+        return None
+    poc = max(profile, key=profile.get)
+    lo = hi = poc
+    acc, total = profile[poc], sum(profile.values())
+    while acc < share * total:
+        up, down = profile.get(hi + step, 0), profile.get(lo - step, 0)
+        if up == down == 0:
+            break
+        if up >= down:
+            hi += step
+            acc += up
+        else:
+            lo -= step
+            acc += down
+    # clusters: local volume peaks, strongest first
+    peaks = [l for l in profile if profile[l] >= profile.get(l - step, 0) and profile[l] >= profile.get(l + step, 0)]
+    picked = []
+    for level in sorted(peaks, key=profile.get, reverse=True):
+        if all(abs(level - other) >= gap for other in picked):
+            picked.append(level)
+    return {"poc": poc, "val": lo, "vah": hi, "nodes": picked[:nodes]}
+
+
+def nearest_clusters(levels, price):
+    """The closest volume cluster (node, POC or value-area edge) above and below the price."""
+    if not levels:
+        return None, None
+    marks = set(levels["nodes"]) | {levels["poc"], levels["val"], levels["vah"]}
+    above = [m for m in marks if m > price]
+    below = [m for m in marks if m < price]
+    return (min(above) if above else None), (max(below) if below else None)
+
+
+def fetch_minutes(day):
+    """Today's ^NDX 1-minute bars as (start epoch, bar), oldest first."""
+    _, entry = tools()
+    ch = entry.get_chart("^NDX", "1m")
+    return [(b["t"], {"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]}) for b in ch["bars"]]
+
+
+# ---------------------------------------------------------------- the personal rulebook (bots/REGELWERK.md)
+
+TIMEFRAMES = {"4H": 48, "2H": 24, "1H": 12, "15M": 3, "5M": 1}   # in 5-minute bars
+WEIGHTS = {"4H": 10, "2H": 8, "1H": 8, "15M": 6, "5M": 4}       # the higher timeframe counts more
+# Scoring only 4H, 1H and 15M, or dropping the FOMO penalty, did worse in the full replay
+# (+0.41 and +0.46 R a trade against +0.53 R), although each looked useless on its own.
+MIN_SCORE = 40       # below this the replay lost money: NO TRADE
+IMPULSE = 2.0        # a signal bar this many times the last hour's average range is a FOMO bar
+
+
+def mtf_trends(sessions, day, slot):
+    """Trend per timeframe (close against a sloping 20-period EMA) at a 5-minute slot's close.
+    Built from the regular US session's bars, so the 4H and 2H differ from a 24-hour CFD chart."""
+    return {name: trend_of(higher_bars(sessions, n, (day, slot))) for name, n in TIMEFRAMES.items()}
+
+
+def impulsive(session, sig, look=12):
+    """Whether the signal bar's range is IMPULSE times the last hour's average range or more."""
+    prev = [session[j]["h"] - session[j]["l"] for j in range(sig["slot"] - look, sig["slot"]) if j in session]
+    bar = session.get(sig["slot"])
+    return bool(prev and bar) and (bar["h"] - bar["l"]) >= IMPULSE * sum(prev) / len(prev)
+
+
+def setup_score(trends, side, quality, bias, fomo=False, cramped=False):
+    """0-100: 50, plus or minus each timeframe's weight as it agrees with or opposes the signal,
+    +10/+5 for a calm/medium volume grade, +-8 with or against the daily trend, -15 for a FOMO
+    bar, and -15 when cramped: a volume cluster less than 1 R away in the trade's direction
+    (off by default: it did worse in the replay, +0.49 against +0.53 R)."""
+    want = "long" if side == "BUY" else "short"
+    score = 50
+    for name, weight in WEIGHTS.items():
+        t = trends.get(name, "neutral")
+        score += weight if t == want else -weight if t != "neutral" else 0
+    score += {"hoch": 10, "mittel": 5}.get(quality, 0)
+    score += 0 if bias == "neutral" else 8 if bias == want else -8
+    score -= 15 if fomo else 0
+    score -= 15 if cramped else 0
+    return max(0, min(100, score))
+
+
+def cramped(sig, clusters):
+    """Whether the nearest volume cluster in the trade's direction is less than 1 R away."""
+    above, below = clusters or (None, None)
+    level = above if sig["side"] == "BUY" else below
+    return level is not None and abs(level - sig["entry"]) < sig["risk"]
