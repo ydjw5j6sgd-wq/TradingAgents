@@ -83,11 +83,13 @@ Wenn der Kurs bereits zu weit gelaufen ist, empfehle NO TRADE und warte auf eine
 **(neu)** „Zu weit gelaufen“ heißt: Der Kurs liegt mehr als **0,15R** hinter dem Signalkurs.
 Dann kein Einstieg, sondern auf einen Rücklauf warten.
 
-## 5a. Handelszeiten (neu)
+## 5a. Handelszeiten (geändert am 05.11.2026)
 
-* Neue Trades nur von **16:00 bis 21:00 Uhr** deutscher Zeit (US-Sitzung; in den Wochen der
-  Zeitumstellung, in denen die USA noch nicht umgestellt haben, eine Stunde früher)
-* Keine Trades vor der US-Eröffnung und nicht in den ersten 30 Minuten danach
+* **Keine feste Handelszeit:** Gehandelt wird, wann immer ein Setup nach diesem Regelwerk entsteht
+  (auf Wunsch des Nutzers gestrichen). Hinweis aus dem Rückblick: Vor der US-Eröffnung (9:00 bis
+  15:25 Uhr) verlor der VWAP-Pullback ohne Score-Auswahl in jeder Variante (Ø −0,17 bis −0,42 R);
+  außerhalb der US-Sitzung daher besonders streng auf Bestätigung und Qualität achten
+* Die Sperrzeiten um Nachrichten (Regel 7) gelten weiter
 * **Keine Positionen über Nacht:** spätestens 21:55 Uhr glattstellen
 * Höchstens **4 Trades pro Tag**
 
@@ -201,7 +203,7 @@ Du bist nicht verpflichtet, jeden Tag einen Trade zu finden. Kapitalerhalt und R
 | 1. Multi-Timeframe | Trend auf 4H, 2H, 1H, 15M und 5M (Schluss gegen steigende/fallende EMA 20), aus den Indexkursen der US-Sitzung. Die höheren Zeiteinheiten zählen mehr im Score |
 | 2./3./4. Setups | VWAP-Pullback und Liquidity Sweep (Fehlausbruch am Stundenhoch/-tief mit Volumen), immer per 5M-Kerzenschluss bestätigt; Volumen-Cluster (POC, VAH, VAL, HVN) als Marken |
 | 5. FOMO | Eine Signalkerze mit doppelter Durchschnittsspanne kostet 15 Punkte; Einstiegsbereich nur bis 0,15R hinter dem Signal |
-| 5a. Zeiten | Signale von 16:10 bis 21:00 Uhr (Kerzenschluss), glatt bis 21:55 Uhr, höchstens 4 pro Tag |
+| 5a. Zeiten | Automatische Signale nur in der US-Sitzung (16:10 bis 21:00 Uhr), weil sie auf Indexkursen laufen und nur dort getestet sind; Analysen auf Anfrage zu jeder Uhrzeit. Glatt bis 21:55 Uhr, höchstens 4 pro Tag |
 | 6. CRV | Ziel 2R (TP2), TP1 1R, TP3 3R; bei +0,5R Stop auf Einstand, danach nachziehen |
 | 6. Risiko | Standard 0,5 % (`--risk-pct`) |
 | 6. Tageslimit | Bei −2 % des Kontos (bei 0,5 % Risiko nach −4R) Schluss für den Tag |
