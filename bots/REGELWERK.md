@@ -224,3 +224,22 @@ gewählt; die nächsten Wochen live zeigen, ob sie hält.
 | FOMO-Abzug für Impulskerzen streichen | Ø +0,46 R statt +0,53 R | Abzug bleibt |
 | −15 Punkte, wenn ein Volumen-Cluster weniger als 1R in Trade-Richtung liegt | Ø +0,49 R statt +0,53 R | nicht übernommen (`cluster_room` aus) |
 | Höchstens 4 Trades pro Tag | kein Unterschied (nie erreicht) | übernommen als Sicherung |
+| RSI-Divergenz (14) als Bestätigung | Signale mit Divergenz in Signalrichtung Ø +0,02 R, ohne Divergenz +0,25 R | nicht übernommen |
+| Ausbruch aus Volatilitäts-Kompression (Bollinger in Keltner) | 5 Trades in 59 Tagen, Ø −0,31 R | nicht übernommen |
+| Gap-Fortsetzung zur US-Eröffnung | Bestätigung nach 30 Min. Ø −0,15 R; nach 15 Min. +0,18 R, aber erste Hälfte negativ und gegen die 30-Minuten-Regel | nicht übernommen |
+| Pairs Trading, Post-Earnings-Drift, RSI-Rotation, Close-to-Open | passen nicht: zwei Werte, Einzelaktien über Wochen, Rotation über viele Aktien, Halten über Nacht | nicht getestet |
+
+## Edge Ratio (MFE/MAE) als Prüfgröße
+
+Die Edge Ratio teilt die durchschnittlich günstigste Bewegung nach dem Einstieg (MFE) durch die
+ungünstigste (MAE), beide in R. Über 1 heißt: Der Kurs läuft öfter und weiter in Trade-Richtung als dagegen.
+
+| Signale (VWAP-Pullback und Fehlausbruch) | nach 30 Min. | nach 60 Min. | nach 120 Min. |
+| --- | --- | --- | --- |
+| alle, ohne Score | 1,03 | 0,95 | 0,90 |
+| **Score ab 40 (werden gesendet)** | **1,87** | **1,82** | **1,92** |
+| Score unter 40 (NO TRADE) | 0,73 | 0,65 | 0,58 |
+
+Der Vorteil steckt also in der Auswahl nach dem Regelwerk (Zeiteinheiten, Volumen, Tagestrend,
+FOMO), nicht im Einstiegsmuster allein. Die Wochenauswertung misst die Edge Ratio der live
+gesendeten Signale; fällt sie über mehrere Wochen unter 1,3, ist das ein Warnzeichen.
