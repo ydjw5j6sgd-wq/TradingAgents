@@ -89,6 +89,8 @@ Dann kein Einstieg, sondern auf einen Rücklauf warten.
   (auf Wunsch des Nutzers gestrichen). Hinweis aus dem Rückblick: Vor der US-Eröffnung (9:00 bis
   15:25 Uhr) verlor der VWAP-Pullback ohne Score-Auswahl in jeder Variante (Ø −0,17 bis −0,42 R);
   außerhalb der US-Sitzung daher besonders streng auf Bestätigung und Qualität achten
+* **Live-Signale: keine neuen Signale ab 18:00 Uhr** (auf Wunsch des Nutzers, seit 07.11.2026). Eine
+  dann noch offene Position wird bis zu ihrem Ende weiter begleitet (Stop nachziehen, Ergebnis)
 * Die Sperrzeiten um Nachrichten (Regel 7) gelten weiter
 * **Keine Positionen über Nacht:** spätestens 21:55 Uhr glattstellen
 * Höchstens **4 Trades pro Tag**
